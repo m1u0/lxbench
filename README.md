@@ -45,3 +45,9 @@ does not select or load a model, accept GGUF arguments, manage the inference
 server, probe health, add authentication, impose a request timeout, grade results,
 or run requests in parallel. Dataset preparation, request profiles, inference
 server operation, and grading remain separate responsibilities.
+
+## Benchmarks
+
+- [MMLU-Redux 2.0](benchmarks/mmlu_redux/README.md): prepare the official
+  provider dataset, run it through this shared runner, and grade overall and
+  per-subject accuracy.
