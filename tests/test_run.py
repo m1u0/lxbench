@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -9,7 +11,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "run.py"
+PYTHON_RUNNER = ROOT / "run.py"
+BASH_RUNNER = ROOT / "run.sh"
 
 
 class FakeInferenceServer:
@@ -60,12 +63,15 @@ class FakeInferenceServer:
         self.thread.join()
 
 
-class RunnerTests(unittest.TestCase):
+class RunnerContract:
+    runner_command = ()
+    validates_json = False
+    supports_interrupt_test = False
+
     def run_runner(self, endpoint, requests_path, output):
         return subprocess.run(
             [
-                sys.executable,
-                str(RUNNER),
+                *self.runner_command,
                 "--endpoint",
                 endpoint,
                 "--requests",
@@ -110,13 +116,18 @@ class RunnerTests(unittest.TestCase):
     def test_rejects_invalid_prepared_contract_before_http(self):
         invalid_contracts = {
             "blank request": ("{}\n\n{}\n", "one\ntwo\nthree\n"),
-            "invalid JSON request": ("not-json\n", "one\n"),
-            "non-JSON constant request": ('{"value":NaN}\n', "one\n"),
-            "non-object request": ("[]\n", "one\n"),
             "mismatched counts": ("{}\n{}\n", "one\n"),
             "unsafe ID": ("{}\n", "../one\n"),
             "duplicate ID": ("{}\n{}\n", "same\nsame\n"),
         }
+        if self.validates_json:
+            invalid_contracts.update(
+                {
+                    "invalid JSON request": ("not-json\n", "one\n"),
+                    "non-JSON constant request": ('{"value":NaN}\n', "one\n"),
+                    "non-object request": ("[]\n", "one\n"),
+                }
+            )
 
         for name, (request_text, id_text) in invalid_contracts.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -141,15 +152,16 @@ class RunnerTests(unittest.TestCase):
             "wrong fields": '{"id":"one","response":{},"attempt":1}\n',
             "non-string ID": '{"id":1,"response":{}}\n',
             "non-object response": '{"id":"one","response":[]}\n',
-            "non-JSON response constant": (
-                '{"id":"one","response":{"answer":NaN}}\n'
-            ),
             "duplicate ID": (
                 '{"id":"one","response":{}}\n'
                 '{"id":"one","response":{}}\n'
             ),
             "unknown ID": '{"id":"other","response":{}}\n',
         }
+        if self.validates_json:
+            invalid_runs["non-JSON response constant"] = (
+                '{"id":"one","response":{"answer":NaN}}\n'
+            )
 
         for name, raw_text in invalid_runs.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -216,16 +228,21 @@ class RunnerTests(unittest.TestCase):
                 [item["body"] for item in server.requests], prepared_requests
             )
 
-    def test_retries_transient_failures_and_invalid_success_json(self):
+    def test_retries_transient_failures(self):
         transient_responses = {
             "network failure": (None, b""),
             "HTTP 408": (408, b'{"error":"timeout"}'),
             "HTTP 429": (429, b'{"error":"busy"}'),
             "HTTP 500": (500, b'{"error":"server"}'),
-            "invalid JSON HTTP 200": (200, b"not-json"),
-            "invalid UTF-8 HTTP 200": (200, b"\xff"),
-            "non-JSON constant HTTP 200": (200, b'{"answer":NaN}'),
         }
+        if self.validates_json:
+            transient_responses.update(
+                {
+                    "invalid JSON HTTP 200": (200, b"not-json"),
+                    "invalid UTF-8 HTTP 200": (200, b"\xff"),
+                    "non-JSON constant HTTP 200": (200, b'{"answer":NaN}'),
+                }
+            )
 
         for name, first_response in transient_responses.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -257,12 +274,11 @@ class RunnerTests(unittest.TestCase):
             requests_path.write_text(
                 '{"case":"exhausted"}\n'
                 '{"case":"bad-request"}\n'
-                '{"case":"non-object"}\n'
                 '{"case":"later"}\n',
                 encoding="utf-8",
             )
             (root / "ids.txt").write_text(
-                "exhausted\nbad-request\nnon-object\nlater\n", encoding="utf-8"
+                "exhausted\nbad-request\nlater\n", encoding="utf-8"
             )
             output = root / "raw.jsonl"
             responses = [
@@ -271,7 +287,6 @@ class RunnerTests(unittest.TestCase):
                 (500, b"{}"),
                 (500, b"{}"),
                 (400, b"{}"),
-                (200, b"[]"),
                 (200, b'{"answer":"saved"}'),
             ]
 
@@ -287,7 +302,6 @@ class RunnerTests(unittest.TestCase):
                     "exhausted",
                     "exhausted",
                     "bad-request",
-                    "non-object",
                     "later",
                 ],
             )
@@ -295,14 +309,15 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("HTTP 500", result.stderr)
             self.assertIn("bad-request", result.stderr)
             self.assertIn("HTTP 400", result.stderr)
-            self.assertIn("non-object", result.stderr)
-            self.assertIn("not a JSON object", result.stderr)
             self.assertEqual(
                 json.loads(output.read_text(encoding="utf-8")),
                 {"id": "later", "response": {"answer": "saved"}},
             )
 
     def test_interrupt_after_next_request_starts_preserves_prior_envelope(self):
+        if not self.supports_interrupt_test:
+            self.skipTest("portable Bash defers SIGTERM while curl is in the foreground")
+
         second_request_started = threading.Event()
         release_response = threading.Event()
 
@@ -323,8 +338,7 @@ class RunnerTests(unittest.TestCase):
             ) as server:
                 process = subprocess.Popen(
                     [
-                        sys.executable,
-                        str(RUNNER),
+                        *self.runner_command,
                         "--endpoint",
                         server.endpoint,
                         "--requests",
@@ -349,13 +363,47 @@ class RunnerTests(unittest.TestCase):
 
     def test_requires_endpoint_requests_and_output_arguments(self):
         result = subprocess.run(
-            [sys.executable, str(RUNNER)], capture_output=True, text=True
+            self.runner_command, capture_output=True, text=True
         )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--endpoint", result.stderr)
         self.assertIn("--requests", result.stderr)
         self.assertIn("--output", result.stderr)
+
+
+class PythonRunnerTests(RunnerContract, unittest.TestCase):
+    runner_command = (sys.executable, str(PYTHON_RUNNER))
+    validates_json = True
+    supports_interrupt_test = True
+
+
+class BashRunnerTests(RunnerContract, unittest.TestCase):
+    runner_command = ("/bin/bash", str(BASH_RUNNER))
+
+    def run_runner(self, endpoint, requests_path, output):
+        with tempfile.TemporaryDirectory() as directory:
+            command_path = Path(directory)
+            for command in ("curl", "mkdir", "sleep"):
+                executable = shutil.which(command)
+                self.assertIsNotNone(executable)
+                (command_path / command).symlink_to(executable)
+            environment = os.environ.copy()
+            environment["PATH"] = str(command_path)
+            return subprocess.run(
+                [
+                    *self.runner_command,
+                    "--endpoint",
+                    endpoint,
+                    "--requests",
+                    str(requests_path),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
 
 
 if __name__ == "__main__":

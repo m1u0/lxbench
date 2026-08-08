@@ -21,6 +21,39 @@ python3 run.py \
   --output results/example/raw.jsonl
 ```
 
+### Board-local Bash fallback
+
+When the workstation cannot reach the board's inference endpoint, copy the Bash
+runner and both aligned prepared files to the board:
+
+```sh
+ssh board 'mkdir -p /tmp/lxbench'
+scp run.sh prepared/example/requests.jsonl prepared/example/ids.txt board:/tmp/lxbench/
+```
+
+On the board, call the complete local endpoint URL and keep the raw run at a
+stable path so rerunning the same command resumes missing IDs:
+
+```sh
+cd /tmp/lxbench
+./run.sh \
+  --endpoint http://127.0.0.1:8080/v1/chat/completions \
+  --requests requests.jsonl \
+  --output raw.jsonl
+```
+
+Retain `raw.jsonl` after the run, then transfer it back to the workstation for
+loading and grading:
+
+```sh
+scp board:/tmp/lxbench/raw.jsonl results/example/raw.jsonl
+```
+
+The fallback requires Bash, `curl`, `mkdir`, and `sleep`; it does not require a
+model file or JSON tooling. Because it has no JSON parser, it embeds compact HTTP
+2xx response bodies directly. Workstation loading or grading performs full JSON
+response validation.
+
 The runner discovers `ids.txt` beside `requests.jsonl` and creates the output
 parent directory when necessary. It sends requests sequentially as JSON `POST`s.
 Every successful JSON-object response is immediately appended and flushed as:
@@ -33,10 +66,10 @@ The raw run is append-only. Reusing an output path validates the existing run,
 skips completed IDs, and executes only missing IDs. Choose a different output path
 to start an independent run.
 
-Network failures, HTTP 408, HTTP 429, HTTP 5xx, and malformed HTTP-2xx JSON are
-retried up to four total attempts, with waits of one, two, and four seconds. Other
-HTTP 4xx responses are not retried. A failed ID stays absent, later IDs continue,
-and the command exits nonzero if any ID fails.
+Network failures, HTTP 408, HTTP 429, and HTTP 5xx are retried up to four total
+attempts, with waits of one, two, and four seconds. The Python runner also retries
+malformed HTTP-2xx JSON. Other HTTP 4xx responses are not retried. A failed ID
+stays absent, later IDs continue, and the command exits nonzero if any ID fails.
 
 ## Execution boundary
 
