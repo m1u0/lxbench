@@ -316,6 +316,53 @@ class LongBenchV2Tests(unittest.TestCase):
         for filename, content in previous.items():
             self.assertEqual((output / filename).read_text(encoding="utf-8"), content)
 
+    def test_prepare_atomically_switches_complete_validated_generations(self):
+        row = {
+            "_id": "first",
+            "domain": "Single-Document QA",
+            "sub_domain": "Atomic publish",
+            "difficulty": "easy",
+            "length": "short",
+            "question": "Which choice?",
+            "choice_A": "Alpha",
+            "choice_B": "Beta",
+            "choice_C": "Gamma",
+            "choice_D": "Delta",
+            "answer": "A",
+            "context": "Alpha is correct.",
+        }
+        self.fixture_path.write_text(json.dumps([row]), encoding="utf-8")
+        output = self.work / "prepared"
+        first_result = self.run_prepare(
+            "--context-size",
+            4096,
+            "--cache",
+            self.work / "cache",
+            "--output",
+            output,
+        )
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        first_generation = output.resolve()
+
+        row["_id"] = "second"
+        self.fixture_path.write_text(json.dumps([row]), encoding="utf-8")
+        second_result = self.run_prepare(
+            "--context-size",
+            4096,
+            "--cache",
+            self.work / "cache",
+            "--output",
+            output,
+        )
+
+        self.assertEqual(second_result.returncode, 0, second_result.stderr)
+        self.assertTrue(output.is_symlink())
+        self.assertNotEqual(output.resolve(), first_generation)
+        self.assertEqual(
+            (first_generation / "ids.txt").read_text(encoding="utf-8"), "first\n"
+        )
+        self.assertEqual((output / "ids.txt").read_text(encoding="utf-8"), "second\n")
+
     def test_grade_uses_provider_extraction_and_standard_breakdowns(self):
         case_fields = [
             ("one", "A", "A", "easy", "short", False),

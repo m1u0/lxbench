@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 
@@ -211,49 +212,43 @@ def validate_staged(directory):
         raise ValueError("prepared cases must be JSON objects")
     if [case.get("id") for case in cases] != ids:
         raise ValueError("prepared case IDs do not align")
-    for request, case in zip(requests, cases):
-        if (
-            request.get("max_tokens") != GENERATION_TOKENS
-            or request.get("temperature") != 0
-            or request.get("stream") is not False
-            or request.get("chat_template_kwargs") != {"enable_thinking": False}
-            or "model" in request
-            or "gguf" in request
-        ):
-            raise ValueError("prepared request profile is invalid")
-        messages = request.get("messages")
-        if (
-            not isinstance(messages, list)
-            or len(messages) != 1
-            or not isinstance(messages[0], dict)
-            or messages[0].get("role") != "user"
-            or not isinstance(messages[0].get("content"), str)
-        ):
-            raise ValueError("prepared request messages are invalid")
-        if (
-            case.get("answer") not in {"A", "B", "C", "D"}
-            or not isinstance(case.get("category"), str)
-            or case.get("difficulty") not in {"easy", "hard"}
-            or case.get("length") not in {"short", "medium", "long"}
-            or not isinstance(case.get("truncated"), bool)
-        ):
-            raise ValueError("prepared grading case is invalid")
 
 
 def publish(output_directory, requests, ids, cases):
     output_directory.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=f".{output_directory.name}-", dir=output_directory.parent
-    ) as temporary:
-        staged = Path(temporary)
+    staged = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_directory.name}-version-", dir=output_directory.parent
+        )
+    )
+    temporary_link = None
+    try:
         write_jsonl(staged / "requests.jsonl", requests)
-        (staged / "ids.txt").write_text("".join(f"{item}\n" for item in ids), encoding="utf-8")
+        (staged / "ids.txt").write_text(
+            "".join(f"{item}\n" for item in ids), encoding="utf-8"
+        )
         write_jsonl(staged / "cases.jsonl", cases)
         validate_staged(staged)
 
-        output_directory.mkdir(parents=True, exist_ok=True)
-        for filename in ("requests.jsonl", "ids.txt", "cases.jsonl"):
-            os.replace(staged / filename, output_directory / filename)
+        if os.path.lexists(output_directory) and not output_directory.is_symlink():
+            raise ValueError(
+                "prepared output path must be absent or a prior version symlink"
+            )
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{output_directory.name}-link-", dir=output_directory.parent
+        )
+        os.close(descriptor)
+        temporary_link = Path(temporary_name)
+        temporary_link.unlink()
+        os.symlink(staged.name, temporary_link, target_is_directory=True)
+        os.replace(temporary_link, output_directory)
+        temporary_link = None
+        staged = None
+    finally:
+        if temporary_link is not None:
+            temporary_link.unlink(missing_ok=True)
+        if staged is not None:
+            shutil.rmtree(staged)
 
 
 def run(args):

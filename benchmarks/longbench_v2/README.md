@@ -35,6 +35,10 @@ safetensors, or GGUF files.
 the target server. Preparation reserves 128 tokens for generation, counts the
 complete non-thinking Qwen chat template, and applies provider-style middle
 truncation only when the rendered chat input exceeds the remaining budget.
+Each successful preparation validates an immutable version directory, then
+atomically switches the requested output path to that complete generation. Old
+hidden version directories are retained for recovery and may be removed manually
+when they are no longer needed.
 
 ```sh
 python3 benchmarks/longbench_v2/prepare.py \
