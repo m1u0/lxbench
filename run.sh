@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 usage() {
     printf 'usage: run.sh --endpoint URL --requests PATH --output PATH\n' >&2
@@ -99,11 +99,7 @@ if [[ -e $output_path ]]; then
         printf 'error: cannot read raw run %s\n' "$output_path" >&2
         exit 1
     fi
-    output_lines=()
     while IFS= read -r line || [[ -n $line ]]; do
-        output_lines[${#output_lines[@]}]=$line
-    done < "$output_path"
-    for line in "${output_lines[@]}"; do
         if [[ ! $line =~ ^\{[[:space:]]*\"id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9][A-Za-z0-9._:-]*)\"[[:space:]]*,[[:space:]]*\"response\"[[:space:]]*:[[:space:]]*\{.*\}[[:space:]]*\}$ ]]; then
             printf 'error: raw run contains a malformed envelope\n' >&2
             exit 1
@@ -118,7 +114,7 @@ if [[ -e $output_path ]]; then
             exit 1
         fi
         completed_ids[${#completed_ids[@]}]=$completed_id
-    done
+    done < "$output_path"
 
     raw_output=
     IFS= read -r -d '' raw_output < "$output_path" || true
@@ -129,6 +125,7 @@ fi
 
 if [[ $output_path == */* ]]; then
     output_parent=${output_path%/*}
+    [[ -n $output_parent ]] || output_parent=/
 else
     output_parent=.
 fi
@@ -143,18 +140,18 @@ fi
 
 post_with_retries() {
     local request_body=$1
-    local attempt combined curl_status http_status retryable wait_seconds
+    local attempt response_and_status curl_status http_status retryable wait_seconds
 
     for attempt in 0 1 2 3; do
-        combined=
-        if combined=$(curl --silent \
+        response_and_status=
+        if response_and_status=$(curl --silent \
             --request POST \
             --header 'Content-Type: application/json' \
             --data-binary "$request_body" \
             --write-out $'\n%{http_code}' \
             "$endpoint"); then
-            http_status=${combined##*$'\n'}
-            response_body=${combined%$'\n'*}
+            http_status=${response_and_status##*$'\n'}
+            response_body=${response_and_status%$'\n'*}
             if [[ $http_status =~ ^2[0-9][0-9]$ ]]; then
                 return 0
             fi
@@ -180,8 +177,6 @@ post_with_retries() {
         esac
         sleep "$wait_seconds"
     done
-
-    return 1
 }
 
 failed=0

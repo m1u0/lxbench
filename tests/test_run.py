@@ -68,7 +68,7 @@ class RunnerContract:
     validates_json = False
     supports_interrupt_test = False
 
-    def run_runner(self, endpoint, requests_path, output):
+    def run_runner(self, endpoint, requests_path, output, environment=None):
         return subprocess.run(
             [
                 *self.runner_command,
@@ -81,6 +81,7 @@ class RunnerContract:
             ],
             capture_output=True,
             text=True,
+            env=environment,
         )
 
     def test_posts_opaque_request_and_appends_exact_envelope(self):
@@ -271,24 +272,29 @@ class RunnerContract:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             requests_path = root / "requests.jsonl"
-            requests_path.write_text(
-                '{"case":"exhausted"}\n'
-                '{"case":"bad-request"}\n'
-                '{"case":"later"}\n',
-                encoding="utf-8",
-            )
-            (root / "ids.txt").write_text(
-                "exhausted\nbad-request\nlater\n", encoding="utf-8"
-            )
-            output = root / "raw.jsonl"
+            cases = ["exhausted", "bad-request"]
             responses = [
                 (500, b"{}"),
                 (500, b"{}"),
                 (500, b"{}"),
                 (500, b"{}"),
                 (400, b"{}"),
-                (200, b'{"answer":"saved"}'),
             ]
+            expected_requests = ["exhausted"] * 4 + ["bad-request"]
+            if self.validates_json:
+                cases.append("non-object")
+                responses.append((200, b"[]"))
+                expected_requests.append("non-object")
+            cases.append("later")
+            responses.append((200, b'{"answer":"saved"}'))
+            expected_requests.append("later")
+
+            requests_path.write_text(
+                "".join(json.dumps({"case": case}) + "\n" for case in cases),
+                encoding="utf-8",
+            )
+            (root / "ids.txt").write_text("\n".join(cases) + "\n", encoding="utf-8")
+            output = root / "raw.jsonl"
 
             with FakeInferenceServer(responses) as server:
                 result = self.run_runner(server.endpoint, requests_path, output)
@@ -296,19 +302,15 @@ class RunnerContract:
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(
                 [item["body"]["case"] for item in server.requests],
-                [
-                    "exhausted",
-                    "exhausted",
-                    "exhausted",
-                    "exhausted",
-                    "bad-request",
-                    "later",
-                ],
+                expected_requests,
             )
             self.assertIn("exhausted", result.stderr)
             self.assertIn("HTTP 500", result.stderr)
             self.assertIn("bad-request", result.stderr)
             self.assertIn("HTTP 400", result.stderr)
+            if self.validates_json:
+                self.assertIn("non-object", result.stderr)
+                self.assertIn("not a JSON object", result.stderr)
             self.assertEqual(
                 json.loads(output.read_text(encoding="utf-8")),
                 {"id": "later", "response": {"answer": "saved"}},
@@ -390,19 +392,8 @@ class BashRunnerTests(RunnerContract, unittest.TestCase):
                 (command_path / command).symlink_to(executable)
             environment = os.environ.copy()
             environment["PATH"] = str(command_path)
-            return subprocess.run(
-                [
-                    *self.runner_command,
-                    "--endpoint",
-                    endpoint,
-                    "--requests",
-                    str(requests_path),
-                    "--output",
-                    str(output),
-                ],
-                capture_output=True,
-                text=True,
-                env=environment,
+            return super().run_runner(
+                endpoint, requests_path, output, environment=environment
             )
 
 
