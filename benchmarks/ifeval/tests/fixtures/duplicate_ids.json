@@ -1,0 +1,14 @@
+[
+  {
+    "key": 7,
+    "prompt": "First prompt.",
+    "instruction_id_list": ["startend:quotation"],
+    "kwargs": [{}]
+  },
+  {
+    "key": 7,
+    "prompt": "Second prompt.",
+    "instruction_id_list": ["startend:quotation"],
+    "kwargs": [{}]
+  }
+]

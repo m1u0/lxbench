@@ -1,0 +1,4 @@
+{"id":"1","key":1,"prompt":"Give quoted answer one.","instruction_id_list":["startend:quotation"],"kwargs":[{}]}
+{"id":"2","key":2,"prompt":"Give quoted answer two.","instruction_id_list":["startend:quotation"],"kwargs":[{}]}
+{"id":"3","key":3,"prompt":"Give quoted answer three.","instruction_id_list":["startend:quotation"],"kwargs":[{}]}
+{"id":"4","key":4,"prompt":"Give quoted answer four.","instruction_id_list":["startend:quotation"],"kwargs":[{}]}

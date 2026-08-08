@@ -1,0 +1,3 @@
+{"id":"1","response":{"choices":[{"message":{"content":"\"strict\""}}]}}
+{"id":"2","response":{"choices":[{"message":{"content":"*\"loose\"*"}}]}}
+{"id":"3","response":{"choices":[{"message":{"content":17}}]}}
