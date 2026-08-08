@@ -131,7 +131,7 @@ class MMLUReduxCommandTests(unittest.TestCase):
                 self.assertEqual(call["kwargs"]["split"], "test")
                 self.assertNotIn("revision", call["kwargs"])
 
-    def test_failed_publication_preserves_the_previous_prepared_benchmark(self):
+    def test_failed_atomic_swap_preserves_the_live_prepared_benchmark(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             cache_dir = root / "cache"
@@ -143,6 +143,7 @@ class MMLUReduxCommandTests(unittest.TestCase):
             previous_files = {
                 path.name: path.read_bytes() for path in output_dir.iterdir()
             }
+            replace_log = root / "replace.log"
 
             failed_result = self.run_prepare(
                 cache_dir,
@@ -150,7 +151,8 @@ class MMLUReduxCommandTests(unittest.TestCase):
                 log_path,
                 {
                     "MMLU_FIXTURE_CHANGED": "1",
-                    "MMLU_FIXTURE_FAIL_PUBLISH": "1",
+                    "MMLU_FIXTURE_FAIL_ATOMIC_SWAP": "1",
+                    "MMLU_FIXTURE_REPLACE_LOG": str(replace_log),
                 },
             )
 
@@ -159,6 +161,11 @@ class MMLUReduxCommandTests(unittest.TestCase):
                 previous_files,
                 {path.name: path.read_bytes() for path in output_dir.iterdir()},
             )
+            replace_sources = [
+                line.split("\t", 1)[0]
+                for line in replace_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertNotIn(str(output_dir), replace_sources)
 
     def test_grade_extracts_one_standalone_letter_and_reports_known_scores(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

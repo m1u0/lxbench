@@ -42,8 +42,6 @@ def make_request(row):
 
 
 def validate_row(row, subject, row_index):
-    if not isinstance(row, dict):
-        raise ValueError(f"{subject} row {row_index} is not an object")
     if not isinstance(row.get("question"), str) or not row["question"].strip():
         raise ValueError(f"{subject} row {row_index} has an invalid question")
     choices = row.get("choices")
@@ -98,21 +96,32 @@ def validate_prepared(directory):
         raise ValueError("requests, IDs, and cases are not aligned")
 
 
-def publish(staging, output):
-    backup = None
-    if output.exists():
-        if not output.is_dir():
-            raise ValueError("prepared output must be a directory")
-        backup = output.with_name(f".{output.name}.backup-{uuid.uuid4().hex}")
-        os.replace(output, backup)
+def publish(version, output):
+    previous_version = None
+    if output.exists() or output.is_symlink():
+        if not output.is_symlink():
+            raise ValueError("existing prepared output was not created by this command")
+        previous_target = Path(os.readlink(output))
+        if not previous_target.is_absolute():
+            previous_target = output.parent / previous_target
+        previous_version = previous_target.resolve()
+
+    pending_link = output.with_name(f".{output.name}.link-{uuid.uuid4().hex}")
+    relative_target = os.path.relpath(version, output.parent)
+    os.symlink(relative_target, pending_link, target_is_directory=True)
     try:
-        os.replace(staging, output)
-    except OSError:
-        if backup is not None:
-            os.replace(backup, output)
-        raise
-    if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
+        os.replace(pending_link, output)
+    finally:
+        if pending_link.is_symlink():
+            pending_link.unlink()
+
+    versions = version.parent.resolve()
+    if (
+        previous_version is not None
+        and previous_version.parent == versions
+        and previous_version.name.startswith("version-")
+    ):
+        shutil.rmtree(previous_version, ignore_errors=True)
 
 
 def prepare(cache_dir, output):
@@ -151,20 +160,22 @@ def prepare(cache_dir, output):
         raise ValueError("generated IDs are not unique")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
-    )
+    versions = output.parent / f".{output.name}.versions"
+    versions.mkdir(exist_ok=True)
+    version = Path(tempfile.mkdtemp(prefix="version-", dir=versions))
+    published = False
     try:
-        write_jsonl(staging / "requests.jsonl", requests)
-        (staging / "ids.txt").write_text(
+        write_jsonl(version / "requests.jsonl", requests)
+        (version / "ids.txt").write_text(
             "".join(f"{case_id}\n" for case_id in ids), encoding="utf-8"
         )
-        write_jsonl(staging / "cases.jsonl", cases)
-        validate_prepared(staging)
-        publish(staging, output)
+        write_jsonl(version / "cases.jsonl", cases)
+        validate_prepared(version)
+        publish(version, output)
+        published = True
     finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        if not published and version.exists():
+            shutil.rmtree(version)
 
 
 def main():
