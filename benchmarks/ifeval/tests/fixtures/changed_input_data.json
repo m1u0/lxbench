@@ -1,0 +1,8 @@
+[
+  {
+    "key": 8,
+    "prompt": "This valid replacement must not survive a failed publication.",
+    "instruction_id_list": ["startend:quotation"],
+    "kwargs": [{}]
+  }
+]

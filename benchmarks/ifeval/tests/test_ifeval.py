@@ -13,13 +13,16 @@ FAKE_DEPENDENCIES = Path(__file__).resolve().parent / "fake_dependencies"
 
 
 class IFEvalCommandTests(unittest.TestCase):
-    def run_prepare(self, cache, output, fixture="input_data.json"):
+    def run_prepare(
+        self, cache, output, fixture="input_data.json", extra_environment=None
+    ):
         environment = os.environ.copy()
         environment["IFEVAL_DATASET_FIXTURE"] = str(FIXTURES / fixture)
         environment["IFEVAL_EXPECTED_CACHE"] = str(cache)
         environment["PYTHONPATH"] = os.pathsep.join(
             [str(FAKE_DEPENDENCIES), environment.get("PYTHONPATH", "")]
         )
+        environment.update(extra_environment or {})
         return subprocess.run(
             [
                 sys.executable,
@@ -113,6 +116,37 @@ class IFEvalCommandTests(unittest.TestCase):
 
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("duplicate", failed.stderr.lower())
+            self.assertEqual(
+                {
+                    name: (output / name).read_bytes()
+                    for name in ("requests.jsonl", "ids.txt", "cases.jsonl")
+                },
+                published,
+            )
+
+    def test_interrupted_atomic_swap_restores_the_previous_prepared_benchmark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            output = root / "prepared"
+            first = self.run_prepare(cache, output)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            previous_target = os.readlink(output)
+            published = {
+                name: (output / name).read_bytes()
+                for name in ("requests.jsonl", "ids.txt", "cases.jsonl")
+            }
+
+            interrupted = self.run_prepare(
+                cache,
+                output,
+                "changed_input_data.json",
+                {"IFEVAL_FAIL_AFTER_SWAP": str(output.absolute())},
+            )
+
+            self.assertNotEqual(interrupted.returncode, 0)
+            self.assertTrue(output.is_symlink())
+            self.assertEqual(os.readlink(output), previous_target)
             self.assertEqual(
                 {
                     name: (output / name).read_bytes()

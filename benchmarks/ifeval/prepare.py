@@ -103,10 +103,12 @@ def validate_prepared(directory):
 
 def publish_prepared(version, output):
     previous_version = None
+    previous_link_target = None
     if output.exists() or output.is_symlink():
         if not output.is_symlink():
             raise ValueError("existing prepared output was not created by this command")
-        previous_target = Path(os.readlink(output))
+        previous_link_target = os.readlink(output)
+        previous_target = Path(previous_link_target)
         if not previous_target.is_absolute():
             previous_target = output.parent / previous_target
         previous_version = previous_target.resolve()
@@ -116,17 +118,29 @@ def publish_prepared(version, output):
     os.symlink(relative_target, pending_link, target_is_directory=True)
     try:
         os.replace(pending_link, output)
+    except BaseException:
+        if output.is_symlink() and output.resolve() == version.resolve():
+            if previous_link_target is None:
+                output.unlink()
+            else:
+                rollback_link = output.with_name(
+                    f".{output.name}.rollback-{uuid.uuid4().hex}"
+                )
+                os.symlink(previous_link_target, rollback_link, target_is_directory=True)
+                try:
+                    os.replace(rollback_link, output)
+                finally:
+                    if rollback_link.is_symlink():
+                        rollback_link.unlink()
+        raise
     finally:
         if pending_link.is_symlink():
             pending_link.unlink()
+    return previous_version
 
-    versions = version.parent.resolve()
-    if (
-        previous_version is not None
-        and previous_version.parent == versions
-        and previous_version.name.startswith("version-")
-    ):
-        shutil.rmtree(previous_version, ignore_errors=True)
+
+def output_points_to(output, version):
+    return output.is_symlink() and output.resolve() == version.resolve()
 
 
 def prepare(cache_dir, output):
@@ -147,7 +161,6 @@ def prepare(cache_dir, output):
     versions = output.parent / f".{output.name}.versions"
     versions.mkdir(exist_ok=True)
     version = Path(tempfile.mkdtemp(prefix="version-", dir=versions))
-    published = False
     try:
         write_jsonl(version / "requests.jsonl", requests)
         (version / "ids.txt").write_text(
@@ -155,10 +168,15 @@ def prepare(cache_dir, output):
         )
         write_jsonl(version / "cases.jsonl", cases)
         validate_prepared(version)
-        publish_prepared(version, output)
-        published = True
+        previous_version = publish_prepared(version, output)
+        if (
+            previous_version is not None
+            and previous_version.parent == versions.resolve()
+            and previous_version.name.startswith("version-")
+        ):
+            shutil.rmtree(previous_version, ignore_errors=True)
     finally:
-        if not published and version.exists():
+        if version.exists() and not output_points_to(output, version):
             shutil.rmtree(version)
 
 
