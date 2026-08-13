@@ -1,58 +1,117 @@
-# lxbench
+# LXBench
 
-`lxbench` executes prepared benchmark requests against an already-running inference
-endpoint. Shared execution is benchmark-agnostic: a preparer owns request content,
-and the runner treats every request as an opaque JSON object.
+LXBench is a minimal, modular harness for running deterministic, code-graded LLM
+benchmarks against an already-running inference endpoint. Each benchmark owns its
+preparation and grading, while a small benchmark-agnostic execution layer runs
+all of them.
 
-## Prepared-to-raw workflow
+The Python runner uses only the standard library. When Python is not available, a
+Bash fallback needs only `curl` and a handful of basic shell utilities, with no
+JSON tooling or benchmark dependencies.
 
-A prepared benchmark directory must contain these aligned UTF-8 files:
+## Design
 
-- `requests.jsonl`: one complete JSON request object per line.
-- `ids.txt`: one unique stable ID per request line. IDs may contain letters,
-  numbers, `.`, `_`, `:`, and `-`, and must begin with a letter or number.
-- `cases.jsonl`: one grading case with a top-level string `id` per request line.
+Benchmark-specific code lives in self-contained directories under `benchmarks/`.
+Each directory holds its preparer, grader, dependencies, documentation, tests,
+and any provider files it needs. The shared boundary is a small file contract,
+not a plugin system or benchmark framework.
 
-Run the prepared requests with Python 3.10 or newer:
+LXBench is provider-first: grading follows the benchmark provider where possible.
+Each benchmark README records its sources, request profile, and any necessary
+deviations. Adding a benchmark should not require changes to the shared runners.
+
+## Workflow
+
+1. A benchmark-specific preparer downloads and caches the official dataset, then
+   writes requests, stable IDs, and grading cases.
+2. The shared runner sends those requests unchanged to an OpenAI-compatible
+   chat-completions endpoint and saves the raw responses.
+3. A benchmark-specific grader joins responses to cases and reports the standard
+   metrics for that benchmark.
+
+Prepared data can be run more than once. Raw responses are kept separately from
+scores, so they can be graded again without repeating inference.
+
+## Benchmarks
+
+| Benchmark | Evaluates | Reports |
+| --- | --- | --- |
+| [MMLU-Redux 2.0](benchmarks/mmlu_redux/README.md) | Multiple-choice knowledge and reasoning | Overall and per-subject accuracy |
+| [IFEval](benchmarks/ifeval/README.md) | Instruction following | Strict and loose prompt-level and instruction-level accuracy |
+| [LongBench v2](benchmarks/longbench_v2/README.md) | Long-context understanding | Overall accuracy with difficulty and context-length breakdowns |
+
+See each benchmark's README for its dependencies, provider sources, request
+profile, grading details, and deviations from the provider's inference setup.
+
+## Quick start: MMLU-Redux
+
+The workstation workflow requires Python 3.10 or newer and an already-running
+inference endpoint. Install the MMLU-Redux dependency:
+
+```sh
+python3 -m pip install -r benchmarks/mmlu_redux/requirements.txt
+```
+
+Prepare the dataset:
+
+```sh
+python3 benchmarks/mmlu_redux/prepare.py \
+  --cache-dir data/mmlu-redux-2.0 \
+  --output prepared/mmlu-redux-2.0
+```
+
+Run it against the endpoint:
 
 ```sh
 python3 run.py \
   --endpoint http://board.example:8080/v1/chat/completions \
-  --requests prepared/example/requests.jsonl \
-  --output results/example/raw.jsonl \
+  --requests prepared/mmlu-redux-2.0/requests.jsonl \
+  --output results/mmlu-redux-2.0/raw.jsonl \
   --concurrency 4
 ```
 
-For a faster, reproducible sampled run, add a positive sample size and optional
-nonnegative seed. The seed defaults to `0`:
+Grade the saved responses:
 
 ```sh
-python3 run.py \
-  --endpoint http://board.example:8080/v1/chat/completions \
-  --requests prepared/example/requests.jsonl \
-  --output results/example/raw.jsonl \
-  --sample-size 50 \
-  --seed 7
+python3 benchmarks/mmlu_redux/grade.py \
+  --cases prepared/mmlu-redux-2.0/cases.jsonl \
+  --responses results/mmlu-redux-2.0/raw.jsonl \
+  --output results/mmlu-redux-2.0/score.json
 ```
 
-Python and Bash select the same IDs for a given prepared benchmark, size, and
-seed. If fewer than the requested number of cases exist, every case is selected.
+The grader prints the result and writes the full JSON summary to the output path.
 
-### Board-local Bash fallback
+## Preparing all benchmarks
 
-When the workstation cannot reach the board's inference endpoint, copy the Bash
-runner and both aligned prepared files to the board:
+After installing the dependencies described in each benchmark README, prepare
+all current datasets with:
 
 ```sh
-ssh board 'mkdir -p /tmp/lxbench'
-scp run.sh prepared/example/requests.jsonl prepared/example/ids.txt board:/tmp/lxbench/
+python3 prepare.py --longbench-context-size 262144
 ```
 
-On the board, call the complete local endpoint URL and keep the raw run at a
-stable path so rerunning the same command resumes missing IDs:
+The LongBench context size must match the effective context configured for the
+target server. Existing valid output is reused. Pass `--force` to regenerate it,
+including after changing the LongBench context size.
+
+## Running and resuming
+
+Both runners support concurrency, reproducible sampling, transient-failure
+retries, and resume by stable case ID. Successful responses are written
+immediately. Reusing an output path skips completed IDs and retries missing ones;
+using a new path starts an independent run.
+
+Add `--sample-size N` and, optionally, `--seed N` to run a stable subset. Sampled
+runs write `<output>.manifest.json`. Keep this file beside the raw responses so
+the grader can recover the selected denominator, including requests that did not
+produce a response.
+
+## Running on a stripped-down system
+
+If the workstation cannot reach the endpoint, copy `run.sh` and the prepared
+`requests.jsonl` and `ids.txt` files to the target, then run:
 
 ```sh
-cd /tmp/lxbench
 ./run.sh \
   --endpoint http://127.0.0.1:8080/v1/chat/completions \
   --requests requests.jsonl \
@@ -60,82 +119,33 @@ cd /tmp/lxbench
   --concurrency 4
 ```
 
-Retain `raw.jsonl` after the run, then transfer it back to the workstation for
-loading and grading:
+Copy `raw.jsonl` back to the workstation for grading, along with its manifest for
+a sampled run. The fallback requires Bash, `curl`, `mkdir`, `rm`, and `sleep`. It
+has no JSON parser, so HTTP 2xx response bodies must be compact JSON on a single
+line. The workstation grader performs full response validation.
 
-```sh
-scp board:/tmp/lxbench/raw.jsonl results/example/raw.jsonl
-```
+## Adding a benchmark
 
-For a sampled run, also retain and transfer the sibling
-`raw.jsonl.manifest.json`. The grader discovers it from the raw response path;
-without it, omitted cases would belong to a full run rather than the sample.
+Every preparer publishes three aligned UTF-8 files:
 
-The fallback requires Bash, `curl`, `mkdir`, `rm`, and `sleep`; it does not
-require a model file or JSON tooling. Because it has no JSON parser, it embeds
-compact HTTP 2xx response bodies directly. Workstation loading or grading
-performs full JSON response validation.
+| File | Purpose |
+| --- | --- |
+| `requests.jsonl` | Complete JSON request bodies sent unchanged by the runner |
+| `ids.txt` | One stable ID per request, aligned by line |
+| `cases.jsonl` | Benchmark-specific information used for grading |
 
-The runner discovers `ids.txt` beside `requests.jsonl` and creates the output
-parent directory when necessary. It sends JSON `POST`s with at most
-`--concurrency N` requests active. `N` must be positive and defaults to `1`.
-Every successful JSON-object response is immediately appended and flushed in
-completion order as:
+The runner reads only requests and IDs. The grader joins cases to raw responses
+by ID. A new benchmark supplies a preparer, grader, dependency list, README, and
+focused tests under `benchmarks/`. Provider code, when needed, belongs in a
+minimal `upstream/` directory.
 
-```json
-{"id": "case-1", "response": {"choices": []}}
-```
+The contract covers deterministic benchmarks whose requests can run
+independently. Interactive or response-dependent benchmarks need a different
+execution model.
 
-The raw run is append-only. Reusing an output path validates the existing run,
-skips completed IDs, and executes only missing IDs. Choose a different output path
-to start an independent run.
+## Scope
 
-Each settled request writes one stable progress line to standard error, for
-example `[12/50] PASS case-12` or `[13/50] FAIL case-13: HTTP 500`. A sampled
-run writes `<output>.manifest.json` before inference with the population size,
-sample size, seed, and selected IDs. Resume requires the same manifest; use a
-different output path to change the sample.
-
-Each benchmark grader automatically uses a valid sibling manifest as its
-denominator. Its saved and printed result identifies the score as sampled,
-including the selected count, full population, and seed. Selected requests that
-never produced a response remain missing and incorrect.
-
-Network failures, HTTP 408, HTTP 429, and HTTP 5xx are retried up to four total
-attempts, with waits of one, two, and four seconds. The Python runner also retries
-malformed HTTP-2xx JSON. Other HTTP 4xx responses are not retried. A failed ID
-stays absent, later IDs continue, and the command exits nonzero if any ID fails.
-On Ctrl-C, the runner stops launching requests, finishes and persists active
-requests, and exits interrupted.
-
-## Execution boundary
-
-The runner does not know benchmark semantics and does not transform requests. It
-does not select or load a model, accept GGUF arguments, manage the inference
-server, probe health, add authentication, impose a request timeout, grade results,
-or choose a concurrency limit automatically. Dataset preparation, request
-profiles, inference server operation, and grading remain separate responsibilities.
-
-## Benchmarks
-
-- [MMLU-Redux 2.0](benchmarks/mmlu_redux/README.md): prepare the official
-  provider dataset, run it through this shared runner, and grade overall and
-  per-subject accuracy.
-- [IFEval](benchmarks/ifeval/README.md): prepare the official instruction-following
-  dataset and grade it with the provider evaluator.
-- [LongBench v2](benchmarks/longbench_v2/README.md): prepare the official
-  zero-shot direct profile with provider-style middle truncation and grading.
-
-## Prepare all datasets
-
-After installing each benchmark's workstation dependencies, prepare every dataset
-up front with the effective context size of the target server:
-
-```sh
-python3 prepare.py --longbench-context-size 262144
-```
-
-Each preparer validates its existing published output and skips dataset loading
-when all aligned files are already complete. Pass `--force` to this command or an
-individual preparer to regenerate its output. In particular, use `--force` after
-changing the LongBench context size.
+LXBench evaluates an already-running endpoint. It does not download or load
+models, manage the inference server, add authentication, compare endpoints,
+aggregate benchmark scores, judge regressions, or provide dedicated latency
+measurement.
