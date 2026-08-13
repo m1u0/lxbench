@@ -295,42 +295,43 @@ class RunnerContract:
                 * 2,
             )
 
-    def test_sample_resume_requires_the_same_manifest(self):
+    def write_sample_resume_fixture(self, root):
         prepared_ids = ["alpha", "bravo", "charlie", "delta", "echo"]
+        requests_path = root / "requests.jsonl"
+        requests_path.write_text(
+            "".join(
+                json.dumps({"case": prepared_id}) + "\n"
+                for prepared_id in prepared_ids
+            ),
+            encoding="utf-8",
+        )
+        (root / "ids.txt").write_text(
+            "\n".join(prepared_ids) + "\n", encoding="utf-8"
+        )
+        output = root / "raw.jsonl"
+        output.write_text(
+            json.dumps({"id": "alpha", "response": {"answer": "done"}}) + "\n",
+            encoding="utf-8",
+        )
+        Path(f"{output}.manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "population_total": 5,
+                    "sample_size": 2,
+                    "seed": 7,
+                    "selected_ids": ["alpha", "charlie"],
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return requests_path, output
 
+    def test_sample_resume_requires_the_same_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            requests_path = root / "requests.jsonl"
-            requests_path.write_text(
-                "".join(
-                    json.dumps({"case": prepared_id}) + "\n"
-                    for prepared_id in prepared_ids
-                ),
-                encoding="utf-8",
-            )
-            (root / "ids.txt").write_text(
-                "\n".join(prepared_ids) + "\n", encoding="utf-8"
-            )
-            output = root / "raw.jsonl"
-            output.write_text(
-                json.dumps({"id": "alpha", "response": {"answer": "done"}})
-                + "\n",
-                encoding="utf-8",
-            )
-            Path(f"{output}.manifest.json").write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "population_total": 5,
-                        "sample_size": 2,
-                        "seed": 7,
-                        "selected_ids": ["alpha", "charlie"],
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            requests_path, output = self.write_sample_resume_fixture(Path(directory))
 
             with FakeInferenceServer([(200, b'{"answer":"finished"}')]) as server:
                 resumed = self.run_runner(
@@ -345,15 +346,19 @@ class RunnerContract:
                 [request["body"]["case"] for request in server.requests], ["charlie"]
             )
             self.assertEqual(resumed.stderr.splitlines(), ["[2/2] PASS charlie"])
-            raw_after_resume = output.read_text(encoding="utf-8")
 
-            conflicts = (
-                ("different size", ("--sample-size", "3", "--seed", "7")),
-                ("different seed", ("--sample-size", "2", "--seed", "8")),
-                ("full run", ()),
-            )
-            for name, extra_args in conflicts:
-                with self.subTest(name=name), FakeInferenceServer([]) as server:
+    def test_sample_resume_rejects_conflicting_parameters(self):
+        conflicts = (
+            ("different size", ("--sample-size", "3", "--seed", "7")),
+            ("different seed", ("--sample-size", "2", "--seed", "8")),
+            ("full run", ()),
+        )
+        for name, extra_args in conflicts:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                requests_path, output = self.write_sample_resume_fixture(Path(directory))
+                raw_before = output.read_text(encoding="utf-8")
+
+                with FakeInferenceServer([]) as server:
                     conflicting = self.run_runner(
                         server.endpoint,
                         requests_path,
@@ -364,8 +369,11 @@ class RunnerContract:
                 self.assertNotEqual(conflicting.returncode, 0)
                 self.assertIn("manifest", conflicting.stderr.lower())
                 self.assertEqual(server.requests, [])
-                self.assertEqual(output.read_text(encoding="utf-8"), raw_after_resume)
+                self.assertEqual(output.read_text(encoding="utf-8"), raw_before)
 
+    def test_sample_resume_rejects_non_integer_manifest_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            requests_path, output = self.write_sample_resume_fixture(Path(directory))
             manifest_path = Path(f"{output}.manifest.json")
             non_integer_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             non_integer_manifest["seed"] = 7.0

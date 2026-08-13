@@ -151,15 +151,15 @@ def main():
     args = parse_args()
     try:
         cases = load_cases(args.cases)
-        selected_ids, sample = load_sample(
+        selected_ids, sample_metadata = load_sample(
             args.responses, [case["id"] for case in cases]
         )
         selected_id_set = set(selected_ids)
         cases = [case for case in cases if case["id"] in selected_id_set]
         responses = load_responses(args.responses, selected_id_set)
         summary = grade(cases, responses)
-        if sample is not None:
-            summary.update(sample)
+        if sample_metadata is not None:
+            summary.update(sample_metadata)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         encoded_summary = json.dumps(summary, indent=2, sort_keys=True) + "\n"
         args.output.write_text(encoded_summary, encoding="utf-8")

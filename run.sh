@@ -123,9 +123,18 @@ sample_hash() {
     sample_hash_result=$hash
 }
 
-selected_indices=()
-selected_ids=()
-if [[ -n $sample_size ]]; then
+select_sample() {
+    local population_total population_text selected_total index selected best_index
+    local -a sample_hashes selected_flags
+
+    selected_indices=()
+    selected_ids=()
+    if [[ -z $sample_size ]]; then
+        selected_indices=("${!ids[@]}")
+        selected_ids=("${ids[@]}")
+        return
+    fi
+
     population_total=${#ids[@]}
     population_text=$population_total
     if ((${#sample_size} < ${#population_text})) ||
@@ -135,8 +144,6 @@ if [[ -n $sample_size ]]; then
         selected_total=$population_total
     fi
 
-    sample_hashes=()
-    selected_flags=()
     for index in "${!ids[@]}"; do
         sample_hash "$seed:${ids[$index]}"
         sample_hashes[$index]=$sample_hash_result
@@ -160,14 +167,21 @@ if [[ -n $sample_size ]]; then
             selected_ids+=("${ids[$index]}")
         fi
     done
-else
-    selected_indices=("${!ids[@]}")
-    selected_ids=("${ids[@]}")
-fi
+}
 
-manifest_path=$output_path.manifest.json
-manifest=
-if [[ -n $sample_size ]]; then
+prepare_sample_manifest() {
+    local separator prepared_id manifest_line manifest_line_count line
+
+    manifest_path=$output_path.manifest.json
+    manifest=
+    if [[ -z $sample_size ]]; then
+        if [[ -e $manifest_path ]]; then
+            printf 'error: sample manifest exists but --sample-size was not provided\n' >&2
+            exit 1
+        fi
+        return
+    fi
+
     manifest='{"version":1,"population_total":'
     manifest+="${#ids[@]},\"sample_size\":$sample_size,\"seed\":$seed,\"selected_ids\":["
     separator=
@@ -195,10 +209,10 @@ if [[ -n $sample_size ]]; then
         printf 'error: sampled output exists without a sample manifest\n' >&2
         exit 1
     fi
-elif [[ -e $manifest_path ]]; then
-    printf 'error: sample manifest exists but --sample-size was not provided\n' >&2
-    exit 1
-fi
+}
+
+select_sample
+prepare_sample_manifest
 
 completed_ids=()
 needs_separator=0

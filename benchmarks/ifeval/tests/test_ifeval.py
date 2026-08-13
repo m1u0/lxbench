@@ -66,6 +66,28 @@ class IFEvalCommandTests(unittest.TestCase):
             env=environment,
         )
 
+    def write_sample_run(self, root):
+        responses = root / "responses.jsonl"
+        first_response = (FIXTURES / "responses.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()[0]
+        responses.write_text(first_response + "\n", encoding="utf-8")
+        manifest_path = Path(f"{responses}.manifest.json")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "population_total": 4,
+                    "sample_size": 2,
+                    "seed": 7,
+                    "selected_ids": ["1", "4"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return responses, manifest_path
+
     def test_prepare_publishes_provider_rows_as_aligned_requests_and_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -208,24 +230,7 @@ class IFEvalCommandTests(unittest.TestCase):
     def test_grade_uses_sample_manifest_as_the_denominator(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            responses = root / "responses.jsonl"
-            first_response = (FIXTURES / "responses.jsonl").read_text(
-                encoding="utf-8"
-            ).splitlines()[0]
-            responses.write_text(first_response + "\n", encoding="utf-8")
-            Path(f"{responses}.manifest.json").write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "population_total": 4,
-                        "sample_size": 2,
-                        "seed": 7,
-                        "selected_ids": ["1", "4"],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            responses, _ = self.write_sample_run(root)
             output = root / "scores.json"
 
             result = self.run_grade(FIXTURES / "cases.jsonl", responses, output)
@@ -242,7 +247,10 @@ class IFEvalCommandTests(unittest.TestCase):
             self.assertEqual(summary["sample_seed"], 7)
             self.assertIn("sample: 2 of 4 cases (seed 7)", result.stdout)
 
-            manifest_path = Path(f"{responses}.manifest.json")
+    def test_grade_rejects_non_integer_sample_manifest_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses, manifest_path = self.write_sample_run(root)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["population_total"] = 4.0
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
@@ -251,8 +259,10 @@ class IFEvalCommandTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
 
-            manifest["population_total"] = 4
-            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    def test_grade_rejects_responses_outside_the_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses, _ = self.write_sample_run(root)
             second_response = (FIXTURES / "responses.jsonl").read_text(
                 encoding="utf-8"
             ).splitlines()[1]

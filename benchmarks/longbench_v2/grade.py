@@ -181,13 +181,13 @@ def print_summary(summary):
 
 def run(args):
     cases, ids = load_cases(args.cases)
-    selected_ids, sample = load_sample(args.responses, ids)
+    selected_ids, sample_metadata = load_sample(args.responses, ids)
     selected_id_set = set(selected_ids)
     cases = [case for case in cases if case["id"] in selected_id_set]
     responses = load_responses(args.responses, selected_ids)
     summary = grade(cases, responses)
-    if sample is not None:
-        summary.update(sample)
+    if sample_metadata is not None:
+        summary.update(sample_metadata)
     write_summary(args.output, summary)
     print_summary(summary)
     return 0

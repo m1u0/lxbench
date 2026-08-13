@@ -149,6 +149,63 @@ class LongBenchV2Tests(unittest.TestCase):
     def chat_response(self, content):
         return {"choices": [{"message": {"content": content}}]}
 
+    def write_sample_grade_inputs(self):
+        cases_path = self.work / "cases.jsonl"
+        responses_path = self.work / "responses.jsonl"
+        self.write_jsonl(
+            cases_path,
+            [
+                {
+                    "id": "alpha",
+                    "answer": "A",
+                    "category": "QA",
+                    "difficulty": "easy",
+                    "length": "short",
+                    "truncated": False,
+                },
+                {
+                    "id": "beta",
+                    "answer": "B",
+                    "category": "QA",
+                    "difficulty": "easy",
+                    "length": "long",
+                    "truncated": False,
+                },
+                {
+                    "id": "gamma",
+                    "answer": "C",
+                    "category": "QA",
+                    "difficulty": "hard",
+                    "length": "medium",
+                    "truncated": False,
+                },
+            ],
+        )
+        self.write_jsonl(
+            responses_path,
+            [
+                {
+                    "id": "alpha",
+                    "response": self.chat_response("The correct answer is (A)"),
+                }
+            ],
+        )
+        manifest_path = Path(f"{responses_path}.manifest.json")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "population_total": 3,
+                    "sample_size": 2,
+                    "seed": 7,
+                    "selected_ids": ["alpha", "beta"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return cases_path, responses_path, manifest_path
+
     def run_grade(self, *arguments):
         return subprocess.run(
             [sys.executable, str(GRADE), *map(str, arguments)],
@@ -534,60 +591,8 @@ class LongBenchV2Tests(unittest.TestCase):
             self.assertIn(label, result.stdout)
 
     def test_grade_uses_sample_manifest_as_the_denominator(self):
-        cases_path = self.work / "cases.jsonl"
-        responses_path = self.work / "responses.jsonl"
+        cases_path, responses_path, _ = self.write_sample_grade_inputs()
         output = self.work / "score.json"
-        self.write_jsonl(
-            cases_path,
-            [
-                {
-                    "id": "alpha",
-                    "answer": "A",
-                    "category": "QA",
-                    "difficulty": "easy",
-                    "length": "short",
-                    "truncated": False,
-                },
-                {
-                    "id": "beta",
-                    "answer": "B",
-                    "category": "QA",
-                    "difficulty": "easy",
-                    "length": "long",
-                    "truncated": False,
-                },
-                {
-                    "id": "gamma",
-                    "answer": "C",
-                    "category": "QA",
-                    "difficulty": "hard",
-                    "length": "medium",
-                    "truncated": False,
-                },
-            ],
-        )
-        self.write_jsonl(
-            responses_path,
-            [
-                {
-                    "id": "alpha",
-                    "response": self.chat_response("The correct answer is (A)"),
-                }
-            ],
-        )
-        Path(f"{responses_path}.manifest.json").write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "population_total": 3,
-                    "sample_size": 2,
-                    "seed": 7,
-                    "selected_ids": ["alpha", "beta"],
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
 
         result = self.run_grade(
             "--cases",
@@ -610,7 +615,8 @@ class LongBenchV2Tests(unittest.TestCase):
         self.assertEqual(summary["sample_seed"], 7)
         self.assertIn("sample: 2 of 3 cases (seed 7)", result.stdout)
 
-        manifest_path = Path(f"{responses_path}.manifest.json")
+    def test_grade_rejects_non_integer_sample_manifest_values(self):
+        cases_path, responses_path, manifest_path = self.write_sample_grade_inputs()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["version"] = 1.0
         manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
@@ -624,8 +630,8 @@ class LongBenchV2Tests(unittest.TestCase):
         )
         self.assertNotEqual(rejected.returncode, 0)
 
-        manifest["version"] = 1
-        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    def test_grade_rejects_responses_outside_the_sample(self):
+        cases_path, responses_path, _ = self.write_sample_grade_inputs()
         self.write_jsonl(
             responses_path,
             [

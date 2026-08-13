@@ -144,7 +144,7 @@ def accuracies(outputs):
 
 def grade(cases_path, responses_path):
     cases = load_cases(cases_path)
-    selected_ids, sample = load_sample(
+    selected_ids, sample_metadata = load_sample(
         responses_path, [prepared_id for prepared_id, _ in cases]
     )
     selected_id_set = set(selected_ids)
@@ -171,8 +171,8 @@ def grade(cases_path, responses_path):
             "loose_instruction_level_accuracy": loose_instruction,
         },
     }
-    if sample is not None:
-        summary.update(sample)
+    if sample_metadata is not None:
+        summary.update(sample_metadata)
     return summary
 
 

@@ -40,6 +40,42 @@ class MMLUReduxCommandTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def write_sample_grade_inputs(self, root):
+        cases_path = root / "cases.jsonl"
+        responses_path = root / "raw.jsonl"
+        self.write_jsonl(
+            cases_path,
+            [
+                {"id": "alpha", "subject": "math", "answer": 0},
+                {"id": "beta", "subject": "math", "answer": 1},
+                {"id": "gamma", "subject": "science", "answer": 2},
+            ],
+        )
+        self.write_jsonl(
+            responses_path,
+            [
+                {
+                    "id": "alpha",
+                    "response": {"choices": [{"message": {"content": "A"}}]},
+                }
+            ],
+        )
+        manifest_path = Path(f"{responses_path}.manifest.json")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "population_total": 3,
+                    "sample_size": 2,
+                    "seed": 7,
+                    "selected_ids": ["alpha", "beta"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return cases_path, responses_path, manifest_path
+
     def run_prepare(
         self, cache_dir, output_dir, log_path, extra_environment=None, force=False
     ):
@@ -368,39 +404,8 @@ class MMLUReduxCommandTests(unittest.TestCase):
     def test_grade_uses_sample_manifest_as_the_denominator(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            cases_path = root / "cases.jsonl"
-            responses_path = root / "raw.jsonl"
+            cases_path, responses_path, _ = self.write_sample_grade_inputs(root)
             score_path = root / "summary.json"
-            self.write_jsonl(
-                cases_path,
-                [
-                    {"id": "alpha", "subject": "math", "answer": 0},
-                    {"id": "beta", "subject": "math", "answer": 1},
-                    {"id": "gamma", "subject": "science", "answer": 2},
-                ],
-            )
-            self.write_jsonl(
-                responses_path,
-                [
-                    {
-                        "id": "alpha",
-                        "response": {"choices": [{"message": {"content": "A"}}]},
-                    }
-                ],
-            )
-            Path(f"{responses_path}.manifest.json").write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "population_total": 3,
-                        "sample_size": 2,
-                        "seed": 7,
-                        "selected_ids": ["alpha", "beta"],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
 
             result = subprocess.run(
                 [
@@ -428,7 +433,13 @@ class MMLUReduxCommandTests(unittest.TestCase):
             self.assertEqual(summary["population_total"], 3)
             self.assertEqual(summary["sample_seed"], 7)
 
-            manifest_path = Path(f"{responses_path}.manifest.json")
+    def test_grade_rejects_non_integer_sample_manifest_values(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cases_path, responses_path, manifest_path = self.write_sample_grade_inputs(
+                root
+            )
+            score_path = root / "summary.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["version"] = True
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
@@ -448,8 +459,11 @@ class MMLUReduxCommandTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
 
-            manifest["version"] = 1
-            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    def test_grade_rejects_responses_outside_the_sample(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cases_path, responses_path, _ = self.write_sample_grade_inputs(root)
+            score_path = root / "summary.json"
             self.write_jsonl(
                 responses_path,
                 [
