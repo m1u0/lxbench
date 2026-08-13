@@ -72,6 +72,7 @@ Shared infrastructure consists of exactly:
 
 - A root Python runner.
 - A root Bash fallback runner.
+- A root Python sample-manifest module shared by the Python runner and graders.
 - Root documentation and ignore rules.
 - Black-box runner tests and a fake HTTP server.
 
@@ -127,10 +128,12 @@ Both runners expose the same arguments:
 | `--requests` | Path to prepared `requests.jsonl` |
 | `--output` | Path to the raw run JSONL |
 | `--concurrency` | Maximum active requests; optional positive integer, default `1` |
+| `--sample-size` | Maximum cases to select; optional positive integer |
+| `--seed` | Sampling seed; optional nonnegative integer, default `0` |
 
 `ids.txt` is resolved beside `requests.jsonl`; there is no ID argument. The output's parent directory is created when absent.
 
-Execution is bounded by `--concurrency`. A runner launches missing requests in prepared order as capacity becomes available and sends each opaque request as an HTTP `POST` with `Content-Type: application/json`. No health check, authentication feature, fixed request timeout, model parameter, or request transformation is part of shared execution.
+Execution is bounded by `--concurrency`. Without `--sample-size`, every prepared ID is selected. With it, both runners rank IDs by the unsigned 32-bit FNV-1a hash of the ASCII string `<seed>:<id>`, using the ID to break hash ties, select the lowest `min(sample-size, prepared-count)` ranks, and restore prepared order before execution. Sampling happens before completed IDs are removed, so resume never changes sample membership. A runner launches missing selected requests in prepared order as capacity becomes available and sends each opaque request as an HTTP `POST` with `Content-Type: application/json`. No health check, authentication feature, fixed request timeout, model parameter, or request transformation is part of shared execution.
 
 The Python runner supports Python 3.10 or newer and uses only the standard library, including `argparse`, `concurrent.futures`, `json`, `pathlib`, `queue`, `time`, and `urllib`. It avoids language features newer than Python 3.10.
 
@@ -159,9 +162,13 @@ The Python runner preserves response meaning rather than response byte layout: J
 
 Only a complete successful response is appended. Each append is flushed when its request completes; concurrent responses therefore appear in completion order. Duplicate output IDs are invalid.
 
+After each selected request settles, the runner writes one durable progress line to standard error: `[completed/selected] PASS id` for a persisted response or `[completed/selected] FAIL id: reason` for a failure. Existing completed IDs initialize `completed` when a run resumes.
+
+When sampling, the runner writes an immutable sibling `<output>.manifest.json` before the first HTTP request. It is one JSON object with exactly `version` (`1`), `population_total`, the requested `sample_size`, `seed`, and `selected_ids` in prepared order. The manifest records the planned denominator, including selected IDs whose requests later fail. A sampled invocation rejects an existing raw output without a manifest and rejects a manifest that does not exactly match the prepared population and requested sample. A full invocation rejects a sibling sample manifest. Changing the sample size or seed therefore requires a different output path.
+
 ### 7. Retry, failure, and ID resume
 
-At startup, a runner validates prepared IDs and loads every valid ID already present in the raw run. It rejects duplicate output IDs or output IDs that are not in the current prepared benchmark. It skips completed IDs and launches absent IDs in prepared order while never exceeding the configured concurrency.
+At startup, a runner validates prepared IDs and loads every valid selected ID already present in the raw run. It rejects duplicate output IDs or output IDs outside the full-run or sampled denominator. It skips completed IDs and launches absent selected IDs in prepared order while never exceeding the configured concurrency.
 
 Retry up to three times after the initial attempt, giving four maximum attempts per invocation. Both runners retry:
 
@@ -255,7 +262,7 @@ Every grader requires:
 | `--responses` | Existing raw run JSONL |
 | `--output` | JSON score-summary path |
 
-The grader joins by ID, rejects duplicate or unknown response IDs, and treats expected IDs absent from the raw run as missing and incorrect in the headline denominator. For the initial OpenAI-style chat endpoint, model text is the string at `response.choices[0].message.content`; a missing or non-string value is invalid. Structurally invalid model answers are incorrect.
+The grader joins by ID, rejects duplicate or unknown response IDs, and treats expected IDs absent from the raw run as missing and incorrect in the headline denominator. When `<responses>.manifest.json` exists, the grader validates its version, fields, population, seed, and deterministic selection, then uses the selected IDs as `expected`; response IDs outside that selection are unknown. For the initial OpenAI-style chat endpoint, model text is the string at `response.choices[0].message.content`; a missing or non-string value is invalid. Structurally invalid model answers are incorrect.
 
 The grader prints the headline metric and concise standard breakdowns, then writes a JSON summary containing:
 
@@ -266,6 +273,8 @@ The grader prints the headline metric and concise standard breakdowns, then writ
 - `missing`.
 - `invalid`.
 - Benchmark-specific `metrics`.
+
+A sampled summary additionally contains `sampled: true`, `population_total`, and `sample_seed`. Printed output states `sample: <expected> of <population_total> cases (seed <sample_seed>)`, either directly or as part of the printed JSON summary.
 
 Grading never performs inference. The same raw run can be graded repeatedly.
 
@@ -307,6 +316,8 @@ The runner tests verify:
 - Other 4xx responses are not retried.
 - Exhausted IDs are absent, later IDs continue, and final status is nonzero.
 - Reusing an output path skips completed IDs and executes missing IDs.
+- A seeded sample selects the same known IDs in both runners, writes its complete manifest before inference, resumes only selected gaps, and rejects conflicting sample parameters.
+- Stable progress lines advance for both successful and failed selected requests.
 - Changing output path starts every case again.
 - Duplicate or unknown IDs in an existing raw run fail before execution.
 - Interrupting between requests leaves earlier envelopes valid.
@@ -322,6 +333,7 @@ Each benchmark carries only enough local fixture data to verify:
 - Response extraction and provider adapter wiring.
 - Known headline and breakdown metrics.
 - Missing and malformed responses.
+- A valid sample manifest changes the grading denominator, preserves selected missing cases as incorrect, and labels the result with population and seed provenance.
 - LongBench middle truncation preserves the beginning and end and respects the configured budget.
 
 Tests do not download full datasets, models, or GGUF files and do not require real inference hardware. Use Python's `unittest` unless provider code already imposes a test dependency.
@@ -332,19 +344,21 @@ Tests do not download full datasets, models, or GGUF files and do not require re
 2. Existing caches are reused without deliberately redownloading their contents.
 3. The Python runner executes any valid prepared benchmark without benchmark imports or third-party packages.
 4. The Bash runner executes the same opaque requests with Bash and curl on the board.
-5. Both runners require endpoint, requests, and output arguments, infer sibling IDs, and accept an optional positive concurrency limit that defaults to one.
-6. Both runners write the exact `{id, response}` raw envelope and flush each success immediately in completion order.
-7. Transient failures receive three retries after the initial attempt; exhausted IDs remain absent while later cases continue.
-8. A run with exhausted IDs exits nonzero without discarding successful responses.
-9. Reusing an output path skips every completed ID and retries every absent ID.
-10. A new output path executes a new independent run.
-11. A normally interrupted raw run remains valid and can resume or be graded.
-12. Each grader scores an existing raw run without inference and writes the agreed summary fields and provider-standard metrics.
-13. IFEval invokes the official evaluator and LongBench invokes the provider direct-answer extractor and metric logic; the MMLU-Redux direct-answer exception is documented.
-14. LongBench preparation enforces its explicit context budget through Qwen tokenization and middle truncation.
-15. Adding a fixture benchmark requires no changes to either shared runner.
-16. Neither runner accepts or discovers a model path, GGUF file, benchmark name, comparison endpoint, or server lifecycle command.
-17. The minimal behavior-level runner and benchmark tests pass without a model or board.
+5. Both runners require endpoint, requests, and output arguments, infer sibling IDs, and accept optional concurrency, sample-size, and seed arguments with the documented validation and defaults.
+6. Both runners select the identical deterministic sample, preserve prepared launch order, and write an immutable planned-denominator manifest before sampled inference.
+7. Both runners write the exact `{id, response}` raw envelope, flush each success immediately in completion order, and report each settled case with a stable progress line.
+8. Transient failures receive three retries after the initial attempt; exhausted IDs remain absent while later cases continue.
+9. A run with exhausted IDs exits nonzero without discarding successful responses.
+10. Reusing an output path skips every completed ID and retries every absent ID in the full or sampled denominator; conflicting sample parameters are rejected.
+11. A new output path executes a new independent run.
+12. A normally interrupted raw run remains valid and can resume or be graded.
+13. Each grader scores an existing raw run without inference and writes the agreed summary fields and provider-standard metrics.
+14. Each grader validates a sibling sample manifest, scores exactly its selected denominator including missing responses, and clearly reports the sampled population and seed.
+15. IFEval invokes the official evaluator and LongBench invokes the provider direct-answer extractor and metric logic; the MMLU-Redux direct-answer exception is documented.
+16. LongBench preparation enforces its explicit context budget through Qwen tokenization and middle truncation.
+17. Adding a fixture benchmark requires no changes to either shared runner.
+18. Neither runner accepts or discovers a model path, GGUF file, benchmark name, comparison endpoint, or server lifecycle command.
+19. The minimal behavior-level runner and benchmark tests pass without a model or board.
 
 ## Out of Scope
 

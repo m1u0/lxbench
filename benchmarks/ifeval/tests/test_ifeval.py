@@ -205,6 +205,63 @@ class IFEvalCommandTests(unittest.TestCase):
             ):
                 self.assertIn(label, result.stdout)
 
+    def test_grade_uses_sample_manifest_as_the_denominator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses = root / "responses.jsonl"
+            first_response = (FIXTURES / "responses.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()[0]
+            responses.write_text(first_response + "\n", encoding="utf-8")
+            Path(f"{responses}.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "population_total": 4,
+                        "sample_size": 2,
+                        "seed": 7,
+                        "selected_ids": ["1", "4"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = root / "scores.json"
+
+            result = self.run_grade(FIXTURES / "cases.jsonl", responses, output)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(summary["expected"], 2)
+            self.assertEqual(summary["received"], 1)
+            self.assertEqual(summary["missing"], 1)
+            self.assertEqual(summary["invalid"], 0)
+            self.assertEqual(summary["metrics"]["strict_prompt_level_accuracy"], 0.5)
+            self.assertEqual(summary["sampled"], True)
+            self.assertEqual(summary["population_total"], 4)
+            self.assertEqual(summary["sample_seed"], 7)
+            self.assertIn("sample: 2 of 4 cases (seed 7)", result.stdout)
+
+            manifest_path = Path(f"{responses}.manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["population_total"] = 4.0
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            rejected = self.run_grade(
+                FIXTURES / "cases.jsonl", responses, root / "rejected.json"
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+            manifest["population_total"] = 4
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            second_response = (FIXTURES / "responses.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()[1]
+            responses.write_text(second_response + "\n", encoding="utf-8")
+            outside_sample = self.run_grade(
+                FIXTURES / "cases.jsonl", responses, root / "outside.json"
+            )
+            self.assertNotEqual(outside_sample.returncode, 0)
+
     def test_grade_rejects_duplicate_and_unknown_response_ids(self):
         invalid_responses = {
             "duplicate": (

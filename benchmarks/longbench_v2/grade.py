@@ -11,6 +11,12 @@ import tempfile
 from upstream.provider import extract_answer, score_predictions
 
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from sample_manifest import load_sample  # noqa: E402
+
+
 BENCHMARK = "longbench-v2"
 PROFILE = "qwen36-deterministic-no-thinking"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -156,6 +162,11 @@ def print_summary(summary):
     print(f"overall_accuracy: {summary['metrics']['overall_accuracy']}")
     print(f"difficulty: {json.dumps(summary['metrics']['difficulty'])}")
     print(f"context_length: {json.dumps(summary['metrics']['context_length'])}")
+    if summary.get("sampled"):
+        print(
+            f"sample: {summary['expected']} of {summary['population_total']} cases "
+            f"(seed {summary['sample_seed']})"
+        )
     for name in (
         "correct",
         "incorrect",
@@ -170,8 +181,13 @@ def print_summary(summary):
 
 def run(args):
     cases, ids = load_cases(args.cases)
-    responses = load_responses(args.responses, ids)
+    selected_ids, sample = load_sample(args.responses, ids)
+    selected_id_set = set(selected_ids)
+    cases = [case for case in cases if case["id"] in selected_id_set]
+    responses = load_responses(args.responses, selected_ids)
     summary = grade(cases, responses)
+    if sample is not None:
+        summary.update(sample)
     write_summary(args.output, summary)
     print_summary(summary)
     return 0

@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from sample_manifest import prepare_sample
+
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 RETRY_WAITS = (1, 2, 4)
@@ -43,6 +45,18 @@ def split_jsonl(text):
     return lines
 
 
+def positive_integer(value):
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(value)
+
+
+def nonnegative_integer(value):
+    if not re.fullmatch(r"0|[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return int(value)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Execute prepared benchmark requests against an inference endpoint."
@@ -51,6 +65,8 @@ def parse_args():
     parser.add_argument("--requests", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--sample-size", type=positive_integer)
+    parser.add_argument("--seed", type=nonnegative_integer, default=0)
     args = parser.parse_args()
     if args.concurrency < 1:
         parser.error("--concurrency must be a positive integer")
@@ -157,14 +173,21 @@ def post_with_retries(endpoint, request_body, stop_requested):
 
 def run(args):
     requests, ids = load_prepared(args.requests)
-    completed, needs_separator = load_completed(args.output, set(ids))
+    selected_ids = prepare_sample(
+        args.output, ids, args.sample_size, args.seed
+    )
+    selected_id_set = set(selected_ids)
+    completed, needs_separator = load_completed(args.output, selected_id_set)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     failed = False
     interrupted = False
+    settled = len(completed)
+    selected_total = len(selected_ids)
     pending = (
         (prepared_id, request_body)
         for prepared_id, request_body in zip(ids, requests)
+        if prepared_id in selected_id_set
         if prepared_id not in completed
     )
     finished = queue.Queue()
@@ -185,14 +208,18 @@ def run(args):
             return True
 
         def record(future):
-            nonlocal failed, needs_separator
+            nonlocal failed, needs_separator, settled
             prepared_id = in_flight.pop(future)
             try:
                 response_body = future.result()
             except CancelledError:
                 return
             except RequestFailure as error:
-                print(f"{prepared_id}: {error}", file=sys.stderr)
+                settled += 1
+                print(
+                    f"[{settled}/{selected_total}] FAIL {prepared_id}: {error}",
+                    file=sys.stderr,
+                )
                 failed = True
                 return
             if needs_separator:
@@ -202,6 +229,8 @@ def run(args):
                 json.dumps({"id": prepared_id, "response": response_body}) + "\n"
             )
             output.flush()
+            settled += 1
+            print(f"[{settled}/{selected_total}] PASS {prepared_id}", file=sys.stderr)
 
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             try:

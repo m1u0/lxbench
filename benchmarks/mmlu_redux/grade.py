@@ -6,6 +6,12 @@ import re
 import sys
 
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from sample_manifest import load_sample  # noqa: E402
+
+
 BENCHMARK = "mmlu-redux-2.0"
 PROFILE = "qwen36-deterministic-no-thinking"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -145,10 +151,15 @@ def main():
     args = parse_args()
     try:
         cases = load_cases(args.cases)
-        responses = load_responses(
-            args.responses, {case["id"] for case in cases}
+        selected_ids, sample = load_sample(
+            args.responses, [case["id"] for case in cases]
         )
+        selected_id_set = set(selected_ids)
+        cases = [case for case in cases if case["id"] in selected_id_set]
+        responses = load_responses(args.responses, selected_id_set)
         summary = grade(cases, responses)
+        if sample is not None:
+            summary.update(sample)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         encoded_summary = json.dumps(summary, indent=2, sort_keys=True) + "\n"
         args.output.write_text(encoded_summary, encoding="utf-8")

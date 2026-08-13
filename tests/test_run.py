@@ -242,6 +242,192 @@ class RunnerContract:
             self.assertEqual(len(by_id["three"]["response"]["content"]), 100_000)
             self.assertEqual(list(root.glob(".lxbench-workers-*")), [])
 
+    def test_sample_size_selects_a_deterministic_subset_and_writes_manifest(self):
+        prepared_ids = ["alpha", "bravo", "charlie", "delta", "echo"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text(
+                "".join(
+                    json.dumps({"case": prepared_id}) + "\n"
+                    for prepared_id in prepared_ids
+                ),
+                encoding="utf-8",
+            )
+            (root / "ids.txt").write_text(
+                "\n".join(prepared_ids) + "\n", encoding="utf-8"
+            )
+            output = root / "raw.jsonl"
+            manifest_path = Path(f"{output}.manifest.json")
+            manifests_seen_during_inference = []
+
+            def response_for(request):
+                manifests_seen_during_inference.append(
+                    json.loads(manifest_path.read_text(encoding="utf-8"))
+                )
+                return 200, json.dumps({"answer": request["case"]}).encode()
+
+            with FakeInferenceServer(response_for=response_for) as server:
+                result = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    extra_args=("--sample-size", "2", "--seed", "7"),
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [request["body"]["case"] for request in server.requests],
+                ["alpha", "charlie"],
+            )
+            self.assertEqual(
+                manifests_seen_during_inference,
+                [
+                    {
+                        "version": 1,
+                        "population_total": 5,
+                        "sample_size": 2,
+                        "seed": 7,
+                        "selected_ids": ["alpha", "charlie"],
+                    }
+                ]
+                * 2,
+            )
+
+    def test_sample_resume_requires_the_same_manifest(self):
+        prepared_ids = ["alpha", "bravo", "charlie", "delta", "echo"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text(
+                "".join(
+                    json.dumps({"case": prepared_id}) + "\n"
+                    for prepared_id in prepared_ids
+                ),
+                encoding="utf-8",
+            )
+            (root / "ids.txt").write_text(
+                "\n".join(prepared_ids) + "\n", encoding="utf-8"
+            )
+            output = root / "raw.jsonl"
+            output.write_text(
+                json.dumps({"id": "alpha", "response": {"answer": "done"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            Path(f"{output}.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "population_total": 5,
+                        "sample_size": 2,
+                        "seed": 7,
+                        "selected_ids": ["alpha", "charlie"],
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with FakeInferenceServer([(200, b'{"answer":"finished"}')]) as server:
+                resumed = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    extra_args=("--sample-size", "2", "--seed", "7"),
+                )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual(
+                [request["body"]["case"] for request in server.requests], ["charlie"]
+            )
+            self.assertEqual(resumed.stderr.splitlines(), ["[2/2] PASS charlie"])
+            raw_after_resume = output.read_text(encoding="utf-8")
+
+            conflicts = (
+                ("different size", ("--sample-size", "3", "--seed", "7")),
+                ("different seed", ("--sample-size", "2", "--seed", "8")),
+                ("full run", ()),
+            )
+            for name, extra_args in conflicts:
+                with self.subTest(name=name), FakeInferenceServer([]) as server:
+                    conflicting = self.run_runner(
+                        server.endpoint,
+                        requests_path,
+                        output,
+                        extra_args=extra_args,
+                    )
+
+                self.assertNotEqual(conflicting.returncode, 0)
+                self.assertIn("manifest", conflicting.stderr.lower())
+                self.assertEqual(server.requests, [])
+                self.assertEqual(output.read_text(encoding="utf-8"), raw_after_resume)
+
+            manifest_path = Path(f"{output}.manifest.json")
+            non_integer_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            non_integer_manifest["seed"] = 7.0
+            manifest_path.write_text(
+                json.dumps(non_integer_manifest) + "\n", encoding="utf-8"
+            )
+            with FakeInferenceServer([]) as server:
+                non_integer = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    extra_args=("--sample-size", "2", "--seed", "7"),
+                )
+
+            self.assertNotEqual(non_integer.returncode, 0)
+            self.assertRegex(non_integer.stderr.lower(), r"manifest|seed")
+            self.assertEqual(server.requests, [])
+
+    def test_sample_rejects_a_legacy_raw_output_without_a_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text("{}\n{}\n", encoding="utf-8")
+            (root / "ids.txt").write_text("one\ntwo\n", encoding="utf-8")
+            output = root / "raw.jsonl"
+            raw_text = '{"id":"one","response":{}}\n'
+            output.write_text(raw_text, encoding="utf-8")
+
+            with FakeInferenceServer([]) as server:
+                result = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    extra_args=("--sample-size", "1"),
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("manifest", result.stderr.lower())
+            self.assertEqual(server.requests, [])
+            self.assertEqual(output.read_text(encoding="utf-8"), raw_text)
+
+    def test_reports_stable_progress_for_successes_and_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text(
+                '{"case":"one"}\n{"case":"two"}\n', encoding="utf-8"
+            )
+            (root / "ids.txt").write_text("one\ntwo\n", encoding="utf-8")
+            output = root / "raw.jsonl"
+
+            with FakeInferenceServer(
+                [(200, b'{"answer":1}'), (400, b'{"error":"bad request"}')]
+            ) as server:
+                result = self.run_runner(server.endpoint, requests_path, output)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                result.stderr.splitlines(),
+                ["[1/2] PASS one", "[2/2] FAIL two: HTTP 400"],
+            )
+
     def test_rejects_invalid_concurrency_before_http(self):
         for concurrency in ("0", "-1", "many"):
             with tempfile.TemporaryDirectory() as directory, self.subTest(
@@ -265,6 +451,96 @@ class RunnerContract:
                 self.assertIn("concurrency", result.stderr.lower())
                 self.assertEqual(server.requests, [])
                 self.assertFalse(output.exists())
+
+    def test_rejects_invalid_sampling_arguments_before_http(self):
+        invalid_arguments = (
+            ("sample size zero", ("--sample-size", "0")),
+            ("negative sample size", ("--sample-size", "-1")),
+            ("non-numeric sample size", ("--sample-size", "many")),
+            ("negative seed", ("--sample-size", "1", "--seed", "-1")),
+            ("non-numeric seed", ("--sample-size", "1", "--seed", "many")),
+        )
+        for name, extra_args in invalid_arguments:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                requests_path = root / "requests.jsonl"
+                requests_path.write_text("{}\n", encoding="utf-8")
+                (root / "ids.txt").write_text("one\n", encoding="utf-8")
+                output = root / "raw.jsonl"
+
+                with FakeInferenceServer([]) as server:
+                    result = self.run_runner(
+                        server.endpoint,
+                        requests_path,
+                        output,
+                        extra_args=extra_args,
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(server.requests, [])
+                self.assertFalse(output.exists())
+
+    def test_sample_size_above_the_population_selects_every_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text('{"case":1}\n{"case":2}\n', encoding="utf-8")
+            (root / "ids.txt").write_text("one\ntwo\n", encoding="utf-8")
+            output = root / "raw.jsonl"
+
+            with FakeInferenceServer(
+                [(200, b'{"answer":1}'), (200, b'{"answer":2}')]
+            ) as server:
+                result = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    extra_args=("--sample-size", "3"),
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [request["body"]["case"] for request in server.requests], [1, 2]
+            )
+            manifest = json.loads(
+                Path(f"{output}.manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["sample_size"], 3)
+            self.assertEqual(manifest["selected_ids"], ["one", "two"])
+
+    def test_sample_hash_ties_use_ascii_id_order(self):
+        prepared_ids = ["q2aa", "mCCn", "other"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests_path = root / "requests.jsonl"
+            requests_path.write_text(
+                "".join(
+                    json.dumps({"case": prepared_id}) + "\n"
+                    for prepared_id in prepared_ids
+                ),
+                encoding="utf-8",
+            )
+            (root / "ids.txt").write_text(
+                "\n".join(prepared_ids) + "\n", encoding="utf-8"
+            )
+            output = root / "raw.jsonl"
+            environment = os.environ.copy()
+            environment["LC_ALL"] = "en_US.UTF-8"
+
+            with FakeInferenceServer([(200, b'{"answer":"ok"}')]) as server:
+                result = self.run_runner(
+                    server.endpoint,
+                    requests_path,
+                    output,
+                    environment=environment,
+                    extra_args=("--sample-size", "1"),
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [request["body"]["case"] for request in server.requests], ["mCCn"]
+            )
 
     def test_rejects_invalid_prepared_contract_before_http(self):
         invalid_contracts = {
@@ -555,14 +831,16 @@ class PythonRunnerTests(RunnerContract, unittest.TestCase):
 class BashRunnerTests(RunnerContract, unittest.TestCase):
     runner_command = ("/bin/bash", str(BASH_RUNNER))
 
-    def run_runner(self, endpoint, requests_path, output, extra_args=()):
+    def run_runner(
+        self, endpoint, requests_path, output, environment=None, extra_args=()
+    ):
         with tempfile.TemporaryDirectory() as directory:
             command_path = Path(directory)
             for command in ("curl", "mkdir", "rm", "sleep"):
                 executable = shutil.which(command)
                 self.assertIsNotNone(executable)
                 (command_path / command).symlink_to(executable)
-            environment = os.environ.copy()
+            environment = os.environ.copy() if environment is None else environment.copy()
             environment["PATH"] = str(command_path)
             return super().run_runner(
                 endpoint,

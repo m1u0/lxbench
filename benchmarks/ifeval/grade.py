@@ -10,9 +10,12 @@ import tempfile
 
 PROFILE = "qwen36-deterministic-no-thinking"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = Path(__file__).resolve().parent / "upstream"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(UPSTREAM))
 
+from sample_manifest import load_sample  # noqa: E402
 from instruction_following_eval import evaluation_lib  # noqa: E402
 
 
@@ -141,7 +144,12 @@ def accuracies(outputs):
 
 def grade(cases_path, responses_path):
     cases = load_cases(cases_path)
-    responses = load_responses(responses_path, {prepared_id for prepared_id, _ in cases})
+    selected_ids, sample = load_sample(
+        responses_path, [prepared_id for prepared_id, _ in cases]
+    )
+    selected_id_set = set(selected_ids)
+    cases = [case for case in cases if case[0] in selected_id_set]
+    responses = load_responses(responses_path, selected_id_set)
     strict = evaluate(cases, responses, evaluation_lib.test_instruction_following_strict)
     loose = evaluate(cases, responses, evaluation_lib.test_instruction_following_loose)
     strict_prompt, strict_instruction = accuracies(strict)
@@ -149,7 +157,7 @@ def grade(cases_path, responses_path):
     expected = len(cases)
     received = len(responses)
     invalid = sum(response is None for response in responses.values())
-    return {
+    summary = {
         "benchmark": "ifeval",
         "profile": PROFILE,
         "expected": expected,
@@ -163,6 +171,9 @@ def grade(cases_path, responses_path):
             "loose_instruction_level_accuracy": loose_instruction,
         },
     }
+    if sample is not None:
+        summary.update(sample)
+    return summary
 
 
 def write_summary(path, summary):
@@ -179,6 +190,11 @@ def write_summary(path, summary):
 def print_summary(summary):
     for field in ("benchmark", "profile", "expected", "received", "missing", "invalid"):
         print(f"{field}: {summary[field]}")
+    if summary.get("sampled"):
+        print(
+            f"sample: {summary['expected']} of {summary['population_total']} cases "
+            f"(seed {summary['sample_seed']})"
+        )
     for name, accuracy in summary["metrics"].items():
         print(f"{name}: {accuracy:.6f}")
 

@@ -1,18 +1,22 @@
 #!/bin/bash
 
+export LC_ALL=C
+
 usage() {
-    printf 'usage: run.sh --endpoint URL --requests PATH --output PATH [--concurrency N]\n' >&2
+    printf 'usage: run.sh --endpoint URL --requests PATH --output PATH [--concurrency N] [--sample-size N] [--seed N]\n' >&2
 }
 
 endpoint=
 requests_path=
 output_path=
 concurrency=1
+sample_size=
+seed=0
 retry_waits=(1 2 4)
 
 while (($# > 0)); do
     case $1 in
-        --endpoint|--requests|--output|--concurrency)
+        --endpoint|--requests|--output|--concurrency|--sample-size|--seed)
             if (($# < 2)); then
                 usage
                 exit 2
@@ -22,6 +26,8 @@ while (($# > 0)); do
                 --requests) requests_path=$2 ;;
                 --output) output_path=$2 ;;
                 --concurrency) concurrency=$2 ;;
+                --sample-size) sample_size=$2 ;;
+                --seed) seed=$2 ;;
             esac
             shift 2
             ;;
@@ -38,6 +44,14 @@ if [[ -z $endpoint || -z $requests_path || -z $output_path ]]; then
 fi
 if [[ ! $concurrency =~ ^[1-9][0-9]*$ ]]; then
     printf 'error: concurrency must be a positive integer\n' >&2
+    exit 2
+fi
+if [[ -n $sample_size && ! $sample_size =~ ^[1-9][0-9]*$ ]]; then
+    printf 'error: sample size must be a positive integer\n' >&2
+    exit 2
+fi
+if [[ ! $seed =~ ^(0|[1-9][0-9]*)$ ]]; then
+    printf 'error: seed must be a nonnegative integer\n' >&2
     exit 2
 fi
 
@@ -99,6 +113,93 @@ for index in "${!ids[@]}"; do
     prepared_ids+=("$prepared_id")
 done
 
+sample_hash() {
+    local value=$1 hash=2166136261 index character code
+    for ((index = 0; index < ${#value}; index += 1)); do
+        character=${value:index:1}
+        printf -v code '%d' "'$character"
+        ((hash = ((hash ^ code) * 16777619) & 0xffffffff))
+    done
+    sample_hash_result=$hash
+}
+
+selected_indices=()
+selected_ids=()
+if [[ -n $sample_size ]]; then
+    population_total=${#ids[@]}
+    population_text=$population_total
+    if ((${#sample_size} < ${#population_text})) ||
+        { ((${#sample_size} == ${#population_text})) && [[ $sample_size < $population_text ]]; }; then
+        selected_total=$sample_size
+    else
+        selected_total=$population_total
+    fi
+
+    sample_hashes=()
+    selected_flags=()
+    for index in "${!ids[@]}"; do
+        sample_hash "$seed:${ids[$index]}"
+        sample_hashes[$index]=$sample_hash_result
+        selected_flags[$index]=0
+    done
+    for ((selected = 0; selected < selected_total; selected += 1)); do
+        best_index=
+        for index in "${!ids[@]}"; do
+            ((${selected_flags[$index]} == 0)) || continue
+            if [[ -z $best_index ]] ||
+                ((sample_hashes[index] < sample_hashes[best_index])) ||
+                { ((sample_hashes[index] == sample_hashes[best_index])) && [[ ${ids[$index]} < ${ids[$best_index]} ]]; }; then
+                best_index=$index
+            fi
+        done
+        selected_flags[$best_index]=1
+    done
+    for index in "${!ids[@]}"; do
+        if ((${selected_flags[$index]})); then
+            selected_indices+=("$index")
+            selected_ids+=("${ids[$index]}")
+        fi
+    done
+else
+    selected_indices=("${!ids[@]}")
+    selected_ids=("${ids[@]}")
+fi
+
+manifest_path=$output_path.manifest.json
+manifest=
+if [[ -n $sample_size ]]; then
+    manifest='{"version":1,"population_total":'
+    manifest+="${#ids[@]},\"sample_size\":$sample_size,\"seed\":$seed,\"selected_ids\":["
+    separator=
+    for prepared_id in "${selected_ids[@]}"; do
+        manifest+="$separator\"$prepared_id\""
+        separator=,
+    done
+    manifest+=']}'
+    if [[ -e $manifest_path ]]; then
+        if [[ ! -r $manifest_path ]]; then
+            printf 'error: cannot read sample manifest %s\n' "$manifest_path" >&2
+            exit 1
+        fi
+        manifest_line=
+        manifest_line_count=0
+        while IFS= read -r line || [[ -n $line ]]; do
+            manifest_line=$line
+            ((manifest_line_count += 1))
+        done < "$manifest_path"
+        if ((manifest_line_count != 1)) || [[ $manifest_line != "$manifest" ]]; then
+            printf 'error: sample manifest does not match the requested sample\n' >&2
+            exit 1
+        fi
+    elif [[ -e $output_path ]]; then
+        printf 'error: sampled output exists without a sample manifest\n' >&2
+        exit 1
+    fi
+elif [[ -e $manifest_path ]]; then
+    printf 'error: sample manifest exists but --sample-size was not provided\n' >&2
+    exit 1
+fi
+
 completed_ids=()
 needs_separator=0
 if [[ -e $output_path ]]; then
@@ -112,7 +213,7 @@ if [[ -e $output_path ]]; then
             exit 1
         fi
         completed_id=${BASH_REMATCH[1]}
-        if ! contains_id "$completed_id" "${prepared_ids[@]}"; then
+        if ! contains_id "$completed_id" "${selected_ids[@]}"; then
             printf 'error: raw run contains unknown ID %s\n' "$completed_id" >&2
             exit 1
         fi
@@ -139,6 +240,12 @@ fi
 if ! mkdir -p "$output_parent"; then
     printf 'error: cannot create output parent %s\n' "$output_parent" >&2
     exit 1
+fi
+if [[ -n $manifest && ! -e $manifest_path ]]; then
+    if ! printf '%s\n' "$manifest" > "$manifest_path"; then
+        printf 'error: cannot write sample manifest %s\n' "$manifest_path" >&2
+        exit 1
+    fi
 fi
 if ! : >> "$output_path"; then
     printf 'error: cannot append to raw run %s\n' "$output_path" >&2
@@ -200,7 +307,7 @@ request_worker() {
 }
 
 pending_indices=()
-for index in "${!ids[@]}"; do
+for index in "${selected_indices[@]}"; do
     if ! contains_id "${ids[$index]}" "${completed_ids[@]}"; then
         pending_indices+=("$index")
     fi
@@ -210,6 +317,8 @@ failed=0
 interrupted=0
 active=0
 next_pending=0
+settled=${#completed_ids[@]}
+selected_total=${#selected_ids[@]}
 worker_dir=
 completion_path=
 slot_active=()
@@ -263,8 +372,12 @@ complete_worker() {
             printf 'error: cannot append to raw run %s\n' "$output_path" >&2
             exit 1
         fi
+        ((settled += 1))
+        printf '[%s/%s] PASS %s\n' "$settled" "$selected_total" "$prepared_id" >&2
     else
-        printf '%s: %s\n' "$prepared_id" "$payload" >&2
+        ((settled += 1))
+        printf '[%s/%s] FAIL %s: %s\n' \
+            "$settled" "$selected_total" "$prepared_id" "$payload" >&2
         failed=1
     fi
 

@@ -533,6 +533,118 @@ class LongBenchV2Tests(unittest.TestCase):
         ):
             self.assertIn(label, result.stdout)
 
+    def test_grade_uses_sample_manifest_as_the_denominator(self):
+        cases_path = self.work / "cases.jsonl"
+        responses_path = self.work / "responses.jsonl"
+        output = self.work / "score.json"
+        self.write_jsonl(
+            cases_path,
+            [
+                {
+                    "id": "alpha",
+                    "answer": "A",
+                    "category": "QA",
+                    "difficulty": "easy",
+                    "length": "short",
+                    "truncated": False,
+                },
+                {
+                    "id": "beta",
+                    "answer": "B",
+                    "category": "QA",
+                    "difficulty": "easy",
+                    "length": "long",
+                    "truncated": False,
+                },
+                {
+                    "id": "gamma",
+                    "answer": "C",
+                    "category": "QA",
+                    "difficulty": "hard",
+                    "length": "medium",
+                    "truncated": False,
+                },
+            ],
+        )
+        self.write_jsonl(
+            responses_path,
+            [
+                {
+                    "id": "alpha",
+                    "response": self.chat_response("The correct answer is (A)"),
+                }
+            ],
+        )
+        Path(f"{responses_path}.manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "population_total": 3,
+                    "sample_size": 2,
+                    "seed": 7,
+                    "selected_ids": ["alpha", "beta"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_grade(
+            "--cases",
+            cases_path,
+            "--responses",
+            responses_path,
+            "--output",
+            output,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(summary["expected"], 2)
+        self.assertEqual(summary["received"], 1)
+        self.assertEqual(summary["missing"], 1)
+        self.assertEqual(summary["incorrect"], 1)
+        self.assertEqual(summary["metrics"]["overall_accuracy"], 50.0)
+        self.assertEqual(summary["sampled"], True)
+        self.assertEqual(summary["population_total"], 3)
+        self.assertEqual(summary["sample_seed"], 7)
+        self.assertIn("sample: 2 of 3 cases (seed 7)", result.stdout)
+
+        manifest_path = Path(f"{responses_path}.manifest.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = 1.0
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        rejected = self.run_grade(
+            "--cases",
+            cases_path,
+            "--responses",
+            responses_path,
+            "--output",
+            self.work / "rejected.json",
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+
+        manifest["version"] = 1
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        self.write_jsonl(
+            responses_path,
+            [
+                {
+                    "id": "gamma",
+                    "response": self.chat_response("The correct answer is (C)"),
+                }
+            ],
+        )
+        outside_sample = self.run_grade(
+            "--cases",
+            cases_path,
+            "--responses",
+            responses_path,
+            "--output",
+            self.work / "outside.json",
+        )
+        self.assertNotEqual(outside_sample.returncode, 0)
+
     def test_grade_rejects_duplicate_and_unknown_response_ids(self):
         cases_path = self.work / "cases.jsonl"
         self.write_jsonl(

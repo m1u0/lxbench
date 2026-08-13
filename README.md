@@ -23,6 +23,21 @@ python3 run.py \
   --concurrency 4
 ```
 
+For a faster, reproducible sampled run, add a positive sample size and optional
+nonnegative seed. The seed defaults to `0`:
+
+```sh
+python3 run.py \
+  --endpoint http://board.example:8080/v1/chat/completions \
+  --requests prepared/example/requests.jsonl \
+  --output results/example/raw.jsonl \
+  --sample-size 50 \
+  --seed 7
+```
+
+Python and Bash select the same IDs for a given prepared benchmark, size, and
+seed. If fewer than the requested number of cases exist, every case is selected.
+
 ### Board-local Bash fallback
 
 When the workstation cannot reach the board's inference endpoint, copy the Bash
@@ -52,6 +67,10 @@ loading and grading:
 scp board:/tmp/lxbench/raw.jsonl results/example/raw.jsonl
 ```
 
+For a sampled run, also retain and transfer the sibling
+`raw.jsonl.manifest.json`. The grader discovers it from the raw response path;
+without it, omitted cases would belong to a full run rather than the sample.
+
 The fallback requires Bash, `curl`, `mkdir`, `rm`, and `sleep`; it does not
 require a model file or JSON tooling. Because it has no JSON parser, it embeds
 compact HTTP 2xx response bodies directly. Workstation loading or grading
@@ -70,6 +89,17 @@ completion order as:
 The raw run is append-only. Reusing an output path validates the existing run,
 skips completed IDs, and executes only missing IDs. Choose a different output path
 to start an independent run.
+
+Each settled request writes one stable progress line to standard error, for
+example `[12/50] PASS case-12` or `[13/50] FAIL case-13: HTTP 500`. A sampled
+run writes `<output>.manifest.json` before inference with the population size,
+sample size, seed, and selected IDs. Resume requires the same manifest; use a
+different output path to change the sample.
+
+Each benchmark grader automatically uses a valid sibling manifest as its
+denominator. Its saved and printed result identifies the score as sampled,
+including the selected count, full population, and seed. Selected requests that
+never produced a response remain missing and incorrect.
 
 Network failures, HTTP 408, HTTP 429, and HTTP 5xx are retried up to four total
 attempts, with waits of one, two, and four seconds. The Python runner also retries

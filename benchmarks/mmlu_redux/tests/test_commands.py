@@ -365,6 +365,116 @@ class MMLUReduxCommandTests(unittest.TestCase):
                 },
             )
 
+    def test_grade_uses_sample_manifest_as_the_denominator(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cases_path = root / "cases.jsonl"
+            responses_path = root / "raw.jsonl"
+            score_path = root / "summary.json"
+            self.write_jsonl(
+                cases_path,
+                [
+                    {"id": "alpha", "subject": "math", "answer": 0},
+                    {"id": "beta", "subject": "math", "answer": 1},
+                    {"id": "gamma", "subject": "science", "answer": 2},
+                ],
+            )
+            self.write_jsonl(
+                responses_path,
+                [
+                    {
+                        "id": "alpha",
+                        "response": {"choices": [{"message": {"content": "A"}}]},
+                    }
+                ],
+            )
+            Path(f"{responses_path}.manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "population_total": 3,
+                        "sample_size": 2,
+                        "seed": 7,
+                        "selected_ids": ["alpha", "beta"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(GRADE),
+                    "--cases",
+                    str(cases_path),
+                    "--responses",
+                    str(responses_path),
+                    "--output",
+                    str(score_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(score_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["expected"], 2)
+            self.assertEqual(summary["received"], 1)
+            self.assertEqual(summary["missing"], 1)
+            self.assertEqual(summary["incorrect"], 1)
+            self.assertEqual(summary["metrics"]["accuracy"], 0.5)
+            self.assertEqual(summary["sampled"], True)
+            self.assertEqual(summary["population_total"], 3)
+            self.assertEqual(summary["sample_seed"], 7)
+
+            manifest_path = Path(f"{responses_path}.manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = True
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    str(GRADE),
+                    "--cases",
+                    str(cases_path),
+                    "--responses",
+                    str(responses_path),
+                    "--output",
+                    str(score_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+            manifest["version"] = 1
+            manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            self.write_jsonl(
+                responses_path,
+                [
+                    {
+                        "id": "gamma",
+                        "response": {"choices": [{"message": {"content": "C"}}]},
+                    }
+                ],
+            )
+            outside_sample = subprocess.run(
+                [
+                    sys.executable,
+                    str(GRADE),
+                    "--cases",
+                    str(cases_path),
+                    "--responses",
+                    str(responses_path),
+                    "--output",
+                    str(score_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(outside_sample.returncode, 0)
+
     def test_grade_rejects_duplicate_and_unknown_response_ids(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
