@@ -24,6 +24,9 @@ Preparation reuses the working Hugging Face cache and publishes the prepared
 directory only after all three files validate. Stable IDs combine the provider
 subject name and the row's original offset within that subject.
 
+If the published output is already complete, preparation exits without loading
+the dataset. Pass `--force` to regenerate it.
+
 Run the opaque requests with the unchanged shared runner:
 
 ```sh

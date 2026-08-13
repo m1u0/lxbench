@@ -3,9 +3,11 @@
 import argparse
 import http.client
 import json
+import queue
 import re
 import sys
-import time
+import threading
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -34,6 +36,13 @@ def decode_json(value):
         raise InvalidJSON from error
 
 
+def split_jsonl(text):
+    lines = text.split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
+    return lines
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Execute prepared benchmark requests against an inference endpoint."
@@ -41,11 +50,15 @@ def parse_args():
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--requests", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    return parser.parse_args()
+    parser.add_argument("--concurrency", type=int, default=1)
+    args = parser.parse_args()
+    if args.concurrency < 1:
+        parser.error("--concurrency must be a positive integer")
+    return args
 
 
 def load_prepared(requests_path):
-    request_lines = requests_path.read_text(encoding="utf-8").splitlines()
+    request_lines = split_jsonl(requests_path.read_text(encoding="utf-8"))
     if any(not line.strip() for line in request_lines):
         raise ValueError("requests file contains a blank record")
 
@@ -77,7 +90,7 @@ def load_completed(output_path, prepared_ids):
         return set(), False
 
     raw_text = output_path.read_text(encoding="utf-8")
-    lines = raw_text.splitlines()
+    lines = split_jsonl(raw_text)
     if any(not line.strip() for line in lines):
         raise ValueError("raw run contains a blank record")
 
@@ -106,10 +119,12 @@ def load_completed(output_path, prepared_ids):
     return completed, bool(raw_text and not raw_text.endswith("\n"))
 
 
-def post_with_retries(endpoint, request_body):
+def post_with_retries(endpoint, request_body, stop_requested):
     request_data = json.dumps(request_body).encode("utf-8")
 
-    for attempt in range(4):
+    for attempt in range(len(RETRY_WAITS) + 1):
+        if stop_requested.is_set():
+            raise RequestFailure("interrupted")
         request = Request(
             endpoint,
             data=request_data,
@@ -119,16 +134,13 @@ def post_with_retries(endpoint, request_body):
         retryable = False
         try:
             with urlopen(request) as response:
-                try:
-                    response_body = decode_json(response.read())
-                except InvalidJSON:
-                    reason = "HTTP 2xx response was not valid JSON"
-                    retryable = True
-                else:
-                    if isinstance(response_body, dict):
-                        return response_body
-                    reason = "HTTP 2xx response was not a JSON object"
-                    retryable = False
+                response_body = decode_json(response.read())
+            if isinstance(response_body, dict):
+                return response_body
+            reason = "HTTP 2xx response was not a JSON object"
+        except InvalidJSON:
+            reason = "HTTP 2xx response was not valid JSON"
+            retryable = True
         except HTTPError as error:
             reason = f"HTTP {error.code}"
             retryable = error.code in (408, 429) or 500 <= error.code <= 599
@@ -137,11 +149,10 @@ def post_with_retries(endpoint, request_body):
             retryable = True
 
         if retryable and attempt < len(RETRY_WAITS):
-            time.sleep(RETRY_WAITS[attempt])
+            if stop_requested.wait(RETRY_WAITS[attempt]):
+                raise RequestFailure("interrupted")
             continue
         raise RequestFailure(reason)
-
-    raise AssertionError("unreachable")
 
 
 def run(args):
@@ -150,16 +161,40 @@ def run(args):
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     failed = False
+    interrupted = False
+    pending = (
+        (prepared_id, request_body)
+        for prepared_id, request_body in zip(ids, requests)
+        if prepared_id not in completed
+    )
+    finished = queue.Queue()
+    in_flight = {}
+    stop_requested = threading.Event()
+
     with args.output.open("a", encoding="utf-8") as output:
-        for prepared_id, request_body in zip(ids, requests):
-            if prepared_id in completed:
-                continue
+        def submit_next(executor):
             try:
-                response_body = post_with_retries(args.endpoint, request_body)
+                prepared_id, request_body = next(pending)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                post_with_retries, args.endpoint, request_body, stop_requested
+            )
+            in_flight[future] = prepared_id
+            future.add_done_callback(finished.put)
+            return True
+
+        def record(future):
+            nonlocal failed, needs_separator
+            prepared_id = in_flight.pop(future)
+            try:
+                response_body = future.result()
+            except CancelledError:
+                return
             except RequestFailure as error:
                 print(f"{prepared_id}: {error}", file=sys.stderr)
                 failed = True
-                continue
+                return
             if needs_separator:
                 output.write("\n")
                 needs_separator = False
@@ -168,6 +203,24 @@ def run(args):
             )
             output.flush()
 
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            try:
+                for _ in range(args.concurrency):
+                    if not submit_next(executor):
+                        break
+                while in_flight:
+                    record(finished.get())
+                    submit_next(executor)
+            except KeyboardInterrupt:
+                interrupted = True
+                stop_requested.set()
+                for future in in_flight:
+                    future.cancel()
+                while in_flight:
+                    record(finished.get())
+
+    if interrupted:
+        return 130
     return 1 if failed else 0
 
 

@@ -119,21 +119,22 @@ Model weights and GGUF files are outside this cache. LongBench preparation downl
 
 ### 5. Shared runner interface
 
-Both runners require the same three arguments:
+Both runners expose the same arguments:
 
 | Argument | Meaning |
 |---|---|
 | `--endpoint` | Complete inference URL, normally ending in `/v1/chat/completions` |
 | `--requests` | Path to prepared `requests.jsonl` |
 | `--output` | Path to the raw run JSONL |
+| `--concurrency` | Maximum active requests; optional positive integer, default `1` |
 
 `ids.txt` is resolved beside `requests.jsonl`; there is no ID argument. The output's parent directory is created when absent.
 
-Execution is sequential. A runner sends each opaque request as an HTTP `POST` with `Content-Type: application/json`. No health check, authentication feature, fixed request timeout, model parameter, or request transformation is part of shared execution.
+Execution is bounded by `--concurrency`. A runner launches missing requests in prepared order as capacity becomes available and sends each opaque request as an HTTP `POST` with `Content-Type: application/json`. No health check, authentication feature, fixed request timeout, model parameter, or request transformation is part of shared execution.
 
-The Python runner supports Python 3.10 or newer and uses only the standard library, including `argparse`, `json`, `pathlib`, `time`, and `urllib`. It avoids language features newer than Python 3.10.
+The Python runner supports Python 3.10 or newer and uses only the standard library, including `argparse`, `concurrent.futures`, `json`, `pathlib`, `queue`, `time`, and `urllib`. It avoids language features newer than Python 3.10.
 
-The Bash runner uses Bash, curl, `mkdir`, and `sleep`. It does not require Python, Node.js, `jq`, `awk`, or `sed`. Safe IDs and the fixed output-envelope shape allow it to recover completed IDs without interpreting request or response semantics.
+The Bash runner uses Bash, curl, `mkdir`, `rm`, and `sleep`. It does not require Python, Node.js, `jq`, `awk`, or `sed`. Safe IDs and the fixed output-envelope shape allow it to recover completed IDs without interpreting request or response semantics.
 
 Benchmark workstation dependencies stay local to their directories:
 
@@ -156,11 +157,11 @@ The runner does not add normalized text, model, usage, timing, hardware, grading
 
 The Python runner preserves response meaning rather than response byte layout: JSON whitespace and key ordering are not contractual. The Bash runner embeds the compact response body directly.
 
-Only a complete successful response is appended. The append is flushed before the next request starts. Duplicate output IDs are invalid.
+Only a complete successful response is appended. Each append is flushed when its request completes; concurrent responses therefore appear in completion order. Duplicate output IDs are invalid.
 
 ### 7. Retry, failure, and ID resume
 
-At startup, a runner validates prepared IDs and loads every valid ID already present in the raw run. It rejects duplicate output IDs or output IDs that are not in the current prepared benchmark. It skips completed IDs and executes absent IDs in prepared order.
+At startup, a runner validates prepared IDs and loads every valid ID already present in the raw run. It rejects duplicate output IDs or output IDs that are not in the current prepared benchmark. It skips completed IDs and launches absent IDs in prepared order while never exceeding the configured concurrency.
 
 Retry up to three times after the initial attempt, giving four maximum attempts per invocation. Both runners retry:
 
@@ -175,7 +176,7 @@ Use fixed waits of one, two, and four seconds before successive retries. Other H
 
 When all attempts fail, write the ID and concise reason to standard error, leave the ID absent from the raw run, and continue. Exit nonzero after processing the remaining IDs if any ID exhausted its attempts. A later invocation with the same output path naturally retries every absent ID.
 
-A normal interrupt happens between completed appends or while an unsaved request is in flight. Previously appended lines remain a valid, regradable raw run. A different output path always represents a new independent run.
+On Ctrl-C, a runner stops launching requests, lets active requests finish, appends their successful responses, and exits interrupted. Previously appended lines remain a valid, regradable raw run. A different output path always represents a new independent run.
 
 ### 8. Shared request profile
 
@@ -299,6 +300,7 @@ A Python standard-library fake HTTP server supplies HTTP 200, 400, 408, 429, and
 The runner tests verify:
 
 - Required arguments and sibling `ids.txt` discovery.
+- Positive concurrency validation, sequential default behavior, and the active-request bound.
 - Mismatched counts, unsafe IDs, and duplicate prepared IDs fail before requests begin.
 - A successful request produces the exact two-field envelope.
 - Transient statuses receive the agreed retries in both runners; invalid successful JSON receives them in Python.
@@ -308,6 +310,7 @@ The runner tests verify:
 - Changing output path starts every case again.
 - Duplicate or unknown IDs in an existing raw run fail before execution.
 - Interrupting between requests leaves earlier envelopes valid.
+- Ctrl-C stops new launches while preserving responses from active requests.
 - The Bash runner matches the Python runner's observable envelope, HTTP-status retry, and resume behavior without Python or JSON-tool dependencies in the script.
 
 ### Benchmark tests
@@ -329,8 +332,8 @@ Tests do not download full datasets, models, or GGUF files and do not require re
 2. Existing caches are reused without deliberately redownloading their contents.
 3. The Python runner executes any valid prepared benchmark without benchmark imports or third-party packages.
 4. The Bash runner executes the same opaque requests with Bash and curl on the board.
-5. Both runners require endpoint, requests, and output arguments and infer sibling IDs.
-6. Both runners write the exact `{id, response}` raw envelope and flush each success before the next request.
+5. Both runners require endpoint, requests, and output arguments, infer sibling IDs, and accept an optional positive concurrency limit that defaults to one.
+6. Both runners write the exact `{id, response}` raw envelope and flush each success immediately in completion order.
 7. Transient failures receive three retries after the initial attempt; exhausted IDs remain absent while later cases continue.
 8. A run with exhausted IDs exits nonzero without discarding successful responses.
 9. Reusing an output path skips every completed ID and retries every absent ID.
@@ -353,7 +356,6 @@ Tests do not download full datasets, models, or GGUF files and do not require re
 - Model/GGUF download, path arguments, checksums, or artifact comparison.
 - Hardware discovery and dedicated performance or latency reporting.
 - Dataset revision pinning and explicit refresh machinery.
-- Parallel inference.
 - Automated transfer to or from the board.
 - Authentication and custom HTTP headers.
 - Cross-benchmark aggregate scores.

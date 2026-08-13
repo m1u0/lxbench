@@ -10,7 +10,7 @@ import unittest
 from tests.test_run import FakeInferenceServer
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 BENCHMARK = ROOT / "benchmarks" / "longbench_v2"
 PREPARE = BENCHMARK / "prepare.py"
 GRADE = BENCHMARK / "grade.py"
@@ -100,12 +100,35 @@ class LongBenchV2Tests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        (self.fake_modules / "sitecustomize.py").write_text(
+            textwrap.dedent(
+                """
+                import os
 
-    def run_prepare(self, *arguments):
+                failure_target = os.environ.get("LXBENCH_FAIL_AFTER_SWAP")
+                if failure_target:
+                    original_replace = os.replace
+                    failed = False
+
+                    def replace(source, destination):
+                        global failed
+                        original_replace(source, destination)
+                        if not failed and os.path.abspath(destination) == failure_target:
+                            failed = True
+                            raise KeyboardInterrupt("fixture interrupt after atomic swap")
+
+                    os.replace = replace
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    def run_prepare(self, *arguments, extra_environment=None):
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(self.fake_modules)
         environment["LXBENCH_FAKE_DATASET"] = str(self.fixture_path)
         environment["LXBENCH_FAKE_CALL_LOG"] = str(self.call_log)
+        environment.update(extra_environment or {})
         return subprocess.run(
             [sys.executable, str(PREPARE), *map(str, arguments)],
             cwd=ROOT,
@@ -179,7 +202,7 @@ class LongBenchV2Tests(unittest.TestCase):
 
             Format your response as follows: "The correct answer is (insert answer here)".
             """
-        ).rstrip("\n")
+        )
         self.assertEqual(
             self.read_jsonl(output / "requests.jsonl"),
             [
@@ -221,18 +244,31 @@ class LongBenchV2Tests(unittest.TestCase):
             Path(tokenizer_call["kwargs"]["local_dir"]), self.work / "cache/tokenizer"
         )
         allowed = tokenizer_call["kwargs"]["allow_patterns"]
-        self.assertTrue(
-            {"tokenizer.json", "tokenizer_config.json", "merges.txt", "vocab.json"}
-            <= set(allowed)
-        )
-        self.assertFalse(
-            any(
-                "model" in pattern.lower() or "gguf" in pattern.lower()
-                for pattern in allowed
-            )
+        self.assertEqual(
+            allowed,
+            [
+                "chat_template.jinja",
+                "merges.txt",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "vocab.json",
+            ],
         )
         load_call = next(call for call in calls if call["call"] == "from_pretrained")
         self.assertTrue(load_call["kwargs"]["local_files_only"])
+
+        calls_before = self.call_log.read_text(encoding="utf-8")
+        skipped = self.run_prepare(
+            "--context-size",
+            4096,
+            "--cache",
+            self.work / "cache",
+            "--output",
+            output,
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertIn("skipping", skipped.stdout)
+        self.assertEqual(self.call_log.read_text(encoding="utf-8"), calls_before)
 
     def test_prepare_requires_effective_context_size(self):
         self.fixture_path.write_text("[]", encoding="utf-8")
@@ -284,7 +320,7 @@ class LongBenchV2Tests(unittest.TestCase):
         self.assertTrue(prompt.startswith("Please read the following text"))
         self.assertTrue(
             prompt.endswith(
-                'Format your response as follows: "The correct answer is (insert answer here)".'
+                'Format your response as follows: "The correct answer is (insert answer here)".\n'
             )
         )
         self.assertNotIn("middle-noise middle-noise middle-noise", prompt)
@@ -353,15 +389,70 @@ class LongBenchV2Tests(unittest.TestCase):
             self.work / "cache",
             "--output",
             output,
+            "--force",
         )
 
         self.assertEqual(second_result.returncode, 0, second_result.stderr)
         self.assertTrue(output.is_symlink())
         self.assertNotEqual(output.resolve(), first_generation)
-        self.assertEqual(
-            (first_generation / "ids.txt").read_text(encoding="utf-8"), "first\n"
-        )
+        self.assertFalse(first_generation.exists())
         self.assertEqual((output / "ids.txt").read_text(encoding="utf-8"), "second\n")
+
+    def test_prepare_interrupted_after_swap_restores_previous_generation(self):
+        row = {
+            "_id": "first",
+            "domain": "Single-Document QA",
+            "sub_domain": "Atomic publish",
+            "difficulty": "easy",
+            "length": "short",
+            "question": "Which choice?",
+            "choice_A": "Alpha",
+            "choice_B": "Beta",
+            "choice_C": "Gamma",
+            "choice_D": "Delta",
+            "answer": "A",
+            "context": "Alpha is correct.",
+        }
+        self.fixture_path.write_text(json.dumps([row]), encoding="utf-8")
+        output = self.work / "prepared"
+        first_result = self.run_prepare(
+            "--context-size",
+            4096,
+            "--cache",
+            self.work / "cache",
+            "--output",
+            output,
+        )
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        previous_target = os.readlink(output)
+        previous = {
+            name: (output / name).read_bytes()
+            for name in ("requests.jsonl", "ids.txt", "cases.jsonl")
+        }
+
+        row["_id"] = "second"
+        self.fixture_path.write_text(json.dumps([row]), encoding="utf-8")
+        interrupted = self.run_prepare(
+            "--context-size",
+            4096,
+            "--cache",
+            self.work / "cache",
+            "--output",
+            output,
+            "--force",
+            extra_environment={"LXBENCH_FAIL_AFTER_SWAP": str(output.absolute())},
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(os.readlink(output), previous_target)
+        self.assertEqual(
+            {
+                name: (output / name).read_bytes()
+                for name in ("requests.jsonl", "ids.txt", "cases.jsonl")
+            },
+            previous,
+        )
 
     def test_grade_uses_provider_extraction_and_standard_breakdowns(self):
         case_fields = [
@@ -480,6 +571,47 @@ class LongBenchV2Tests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(name, result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_grade_rejects_non_json_constants(self):
+        cases_path = self.work / "cases.jsonl"
+        self.write_jsonl(
+            cases_path,
+            [
+                {
+                    "id": "known",
+                    "answer": "A",
+                    "category": "QA",
+                    "difficulty": "easy",
+                    "length": "short",
+                    "truncated": False,
+                }
+            ],
+        )
+        response_template = (
+            '{"id":"known","response":{"choices":[{"message":'
+            '{"content":CONSTANT}}]}}\n'
+        )
+
+        for constant in ("NaN", "Infinity"):
+            with self.subTest(constant=constant):
+                responses_path = self.work / f"responses-{constant}.jsonl"
+                responses_path.write_text(
+                    response_template.replace("CONSTANT", constant), encoding="utf-8"
+                )
+                output = self.work / f"score-{constant}.json"
+
+                result = self.run_grade(
+                    "--cases",
+                    cases_path,
+                    "--responses",
+                    responses_path,
+                    "--output",
+                    output,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("non-JSON constant", result.stderr)
                 self.assertFalse(output.exists())
 
     def test_prepare_runner_grade_smoke_flow_uses_unchanged_generic_runner(self):

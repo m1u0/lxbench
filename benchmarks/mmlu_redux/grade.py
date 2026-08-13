@@ -20,14 +20,20 @@ def parse_args():
     return parser.parse_args()
 
 
+def reject_json_constant(value):
+    raise ValueError(f"non-JSON constant {value}")
+
+
 def load_jsonl(path, record_name):
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
     if any(not line.strip() for line in lines):
         raise ValueError(f"{record_name} contains a blank record")
     records = []
     for line_number, line in enumerate(lines, start=1):
         try:
-            record = json.loads(line)
+            record = json.loads(line, parse_constant=reject_json_constant)
         except json.JSONDecodeError as error:
             raise ValueError(
                 f"{record_name} line {line_number} is not valid JSON"
@@ -69,7 +75,7 @@ def load_responses(path, expected_ids):
         if response_id in responses:
             raise ValueError(f"response line {line_number} has a duplicate ID")
         responses[response_id] = record.get("response")
-    return records, responses
+    return responses
 
 
 def extract_answer(response):
@@ -85,7 +91,7 @@ def extract_answer(response):
     return "ABCD".index(tokens[0].upper())
 
 
-def grade(cases, response_records, responses):
+def grade(cases, responses):
     correct = 0
     invalid = 0
     missing = 0
@@ -122,7 +128,7 @@ def grade(cases, response_records, responses):
         "benchmark": BENCHMARK,
         "profile": PROFILE,
         "expected": total,
-        "received": len(response_records),
+        "received": len(responses),
         "correct": correct,
         "incorrect": total - correct,
         "invalid": invalid,
@@ -139,10 +145,10 @@ def main():
     args = parse_args()
     try:
         cases = load_cases(args.cases)
-        response_records, responses = load_responses(
+        responses = load_responses(
             args.responses, {case["id"] for case in cases}
         )
-        summary = grade(cases, response_records, responses)
+        summary = grade(cases, responses)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         encoded_summary = json.dumps(summary, indent=2, sort_keys=True) + "\n"
         args.output.write_text(encoded_summary, encoding="utf-8")

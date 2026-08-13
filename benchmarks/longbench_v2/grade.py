@@ -16,6 +16,10 @@ PROFILE = "qwen36-deterministic-no-thinking"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
+def reject_json_constant(value):
+    raise ValueError(f"non-JSON constant {value}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Grade a LongBench v2 raw run.")
     parser.add_argument("--cases", type=Path, required=True)
@@ -25,13 +29,15 @@ def parse_args():
 
 
 def read_jsonl(path, record_name):
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
     if any(not line.strip() for line in lines):
         raise ValueError(f"{record_name} file contains a blank record")
     records = []
     for line_number, line in enumerate(lines, start=1):
         try:
-            record = json.loads(line)
+            record = json.loads(line, parse_constant=reject_json_constant)
         except json.JSONDecodeError as error:
             raise ValueError(
                 f"{record_name} line {line_number} is not valid JSON"
@@ -78,24 +84,20 @@ def load_responses(path, expected_ids):
 
 
 def extract_content(response):
-    if not isinstance(response, dict):
+    try:
+        content = response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
         return None
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        return None
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        return None
-    content = message.get("content")
     return content if isinstance(content, str) else None
 
 
-def grade(cases, ids, responses):
+def grade(cases, responses):
     predictions = []
     correct = 0
     invalid = 0
     missing = 0
-    for case, prepared_id in zip(cases, ids):
+    for case in cases:
+        prepared_id = case["id"]
         if prepared_id not in responses:
             prediction = None
             missing += 1
@@ -169,7 +171,7 @@ def print_summary(summary):
 def run(args):
     cases, ids = load_cases(args.cases)
     responses = load_responses(args.responses, ids)
-    summary = grade(cases, ids, responses)
+    summary = grade(cases, responses)
     write_summary(args.output, summary)
     print_summary(summary)
     return 0

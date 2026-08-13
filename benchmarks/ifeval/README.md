@@ -30,6 +30,9 @@ executable grading code is downloaded at runtime.
 Preparation passes no explicit dataset revision. Hugging Face therefore reuses
 the supplied working cache after the first download.
 
+If the published output is already complete, preparation exits without loading
+the dataset. Pass `--force` to regenerate it.
+
 ```sh
 python benchmarks/ifeval/prepare.py \
   --cache-dir data/ifeval \

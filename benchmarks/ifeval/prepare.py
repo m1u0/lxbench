@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
 import uuid
 
@@ -17,6 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Prepare IFEval requests and cases.")
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
@@ -78,7 +80,9 @@ def reject_json_constant(value):
 
 
 def read_jsonl(path):
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
     if not lines or any(not line.strip() for line in lines):
         raise ValueError(f"{path.name} must contain nonblank records")
     return [json.loads(line, parse_constant=reject_json_constant) for line in lines]
@@ -101,7 +105,27 @@ def validate_prepared(directory):
         raise ValueError("grading cases are not aligned with prepared IDs")
 
 
-def publish_prepared(version, output):
+def already_prepared(output):
+    if not output.is_symlink():
+        return False
+    try:
+        validate_prepared(output)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def replace_symlink(target, output, purpose):
+    pending_link = output.with_name(f".{output.name}.{purpose}-{uuid.uuid4().hex}")
+    os.symlink(target, pending_link, target_is_directory=True)
+    try:
+        os.replace(pending_link, output)
+    finally:
+        if pending_link.is_symlink():
+            pending_link.unlink()
+
+
+def publish(version, output):
     previous_version = None
     previous_link_target = None
     if output.exists() or output.is_symlink():
@@ -113,30 +137,28 @@ def publish_prepared(version, output):
             previous_target = output.parent / previous_target
         previous_version = previous_target.resolve()
 
-    pending_link = output.with_name(f".{output.name}.link-{uuid.uuid4().hex}")
     relative_target = os.path.relpath(version, output.parent)
-    os.symlink(relative_target, pending_link, target_is_directory=True)
     try:
-        os.replace(pending_link, output)
+        replace_symlink(relative_target, output, "link")
     except BaseException:
-        if output.is_symlink() and output.resolve() == version.resolve():
+        if output_points_to(output, version):
             if previous_link_target is None:
                 output.unlink()
             else:
-                rollback_link = output.with_name(
-                    f".{output.name}.rollback-{uuid.uuid4().hex}"
+                replace_symlink(
+                    previous_link_target,
+                    output,
+                    "rollback",
                 )
-                os.symlink(previous_link_target, rollback_link, target_is_directory=True)
-                try:
-                    os.replace(rollback_link, output)
-                finally:
-                    if rollback_link.is_symlink():
-                        rollback_link.unlink()
         raise
-    finally:
-        if pending_link.is_symlink():
-            pending_link.unlink()
-    return previous_version
+
+    versions = version.parent.resolve()
+    if (
+        previous_version is not None
+        and previous_version.parent == versions
+        and previous_version.name.startswith("version-")
+    ):
+        shutil.rmtree(previous_version, ignore_errors=True)
 
 
 def output_points_to(output, version):
@@ -168,13 +190,7 @@ def prepare(cache_dir, output):
         )
         write_jsonl(version / "cases.jsonl", cases)
         validate_prepared(version)
-        previous_version = publish_prepared(version, output)
-        if (
-            previous_version is not None
-            and previous_version.parent == versions.resolve()
-            and previous_version.name.startswith("version-")
-        ):
-            shutil.rmtree(previous_version, ignore_errors=True)
+        publish(version, output)
     finally:
         if version.exists() and not output_points_to(output, version):
             shutil.rmtree(version)
@@ -183,9 +199,12 @@ def prepare(cache_dir, output):
 def main():
     args = parse_args()
     try:
+        if not args.force and already_prepared(args.output):
+            print(f"prepared output already exists in {args.output}; skipping")
+            return 0
         prepare(args.cache_dir, args.output)
     except (KeyError, OSError, TypeError, ValueError) as error:
-        print(f"error: {error}", file=__import__("sys").stderr)
+        print(f"error: {error}", file=sys.stderr)
         return 1
     return 0
 

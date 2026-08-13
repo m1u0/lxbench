@@ -14,7 +14,12 @@ FAKE_DEPENDENCIES = Path(__file__).resolve().parent / "fake_dependencies"
 
 class IFEvalCommandTests(unittest.TestCase):
     def run_prepare(
-        self, cache, output, fixture="input_data.json", extra_environment=None
+        self,
+        cache,
+        output,
+        fixture="input_data.json",
+        extra_environment=None,
+        force=False,
     ):
         environment = os.environ.copy()
         environment["IFEVAL_DATASET_FIXTURE"] = str(FIXTURES / fixture)
@@ -23,15 +28,18 @@ class IFEvalCommandTests(unittest.TestCase):
             [str(FAKE_DEPENDENCIES), environment.get("PYTHONPATH", "")]
         )
         environment.update(extra_environment or {})
+        command = [
+            sys.executable,
+            str(BENCHMARK_ROOT / "prepare.py"),
+            "--cache-dir",
+            str(cache),
+            "--output",
+            str(output),
+        ]
+        if force:
+            command.append("--force")
         return subprocess.run(
-            [
-                sys.executable,
-                str(BENCHMARK_ROOT / "prepare.py"),
-                "--cache-dir",
-                str(cache),
-                "--output",
-                str(output),
-            ],
+            command,
             capture_output=True,
             text=True,
             env=environment,
@@ -87,7 +95,8 @@ class IFEvalCommandTests(unittest.TestCase):
             replacement = self.run_prepare(cache, output)
             self.assertEqual(replacement.returncode, 0, replacement.stderr)
             self.assertTrue(output.is_symlink())
-            self.assertNotEqual(os.readlink(output), first_version)
+            self.assertEqual(os.readlink(output), first_version)
+            self.assertIn("skipping", replacement.stdout)
             self.assertEqual((output / "ids.txt").read_text(encoding="utf-8"), "7\n")
             self.assertEqual(
                 json.loads((output / "cases.jsonl").read_text(encoding="utf-8")),
@@ -112,7 +121,7 @@ class IFEvalCommandTests(unittest.TestCase):
                 for name in ("requests.jsonl", "ids.txt", "cases.jsonl")
             }
 
-            failed = self.run_prepare(cache, output, "duplicate_ids.json")
+            failed = self.run_prepare(cache, output, "duplicate_ids.json", force=True)
 
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("duplicate", failed.stderr.lower())
@@ -142,6 +151,7 @@ class IFEvalCommandTests(unittest.TestCase):
                 output,
                 "changed_input_data.json",
                 {"IFEVAL_FAIL_AFTER_SWAP": str(output.absolute())},
+                force=True,
             )
 
             self.assertNotEqual(interrupted.returncode, 0)

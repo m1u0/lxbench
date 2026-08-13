@@ -17,5 +17,5 @@ These four files are the smallest evaluator surface needed by the strict and
 loose grading functions. The provider command wrapper, data, tests, and shell
 script are not required by this benchmark adapter and were not copied.
 
-The repository's Apache License 2.0 is copied at `../LICENSE`. Workstation
-dependencies are recorded in `../../requirements.txt`.
+The repository's Apache License 2.0 is copied in [LICENSE](LICENSE). Workstation
+dependencies are recorded in [../requirements.txt](../requirements.txt).

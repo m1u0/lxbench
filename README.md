@@ -11,6 +11,7 @@ A prepared benchmark directory must contain these aligned UTF-8 files:
 - `requests.jsonl`: one complete JSON request object per line.
 - `ids.txt`: one unique stable ID per request line. IDs may contain letters,
   numbers, `.`, `_`, `:`, and `-`, and must begin with a letter or number.
+- `cases.jsonl`: one grading case with a top-level string `id` per request line.
 
 Run the prepared requests with Python 3.10 or newer:
 
@@ -18,7 +19,8 @@ Run the prepared requests with Python 3.10 or newer:
 python3 run.py \
   --endpoint http://board.example:8080/v1/chat/completions \
   --requests prepared/example/requests.jsonl \
-  --output results/example/raw.jsonl
+  --output results/example/raw.jsonl \
+  --concurrency 4
 ```
 
 ### Board-local Bash fallback
@@ -39,7 +41,8 @@ cd /tmp/lxbench
 ./run.sh \
   --endpoint http://127.0.0.1:8080/v1/chat/completions \
   --requests requests.jsonl \
-  --output raw.jsonl
+  --output raw.jsonl \
+  --concurrency 4
 ```
 
 Retain `raw.jsonl` after the run, then transfer it back to the workstation for
@@ -49,14 +52,16 @@ loading and grading:
 scp board:/tmp/lxbench/raw.jsonl results/example/raw.jsonl
 ```
 
-The fallback requires Bash, `curl`, `mkdir`, and `sleep`; it does not require a
-model file or JSON tooling. Because it has no JSON parser, it embeds compact HTTP
-2xx response bodies directly. Workstation loading or grading performs full JSON
-response validation.
+The fallback requires Bash, `curl`, `mkdir`, `rm`, and `sleep`; it does not
+require a model file or JSON tooling. Because it has no JSON parser, it embeds
+compact HTTP 2xx response bodies directly. Workstation loading or grading
+performs full JSON response validation.
 
 The runner discovers `ids.txt` beside `requests.jsonl` and creates the output
-parent directory when necessary. It sends requests sequentially as JSON `POST`s.
-Every successful JSON-object response is immediately appended and flushed as:
+parent directory when necessary. It sends JSON `POST`s with at most
+`--concurrency N` requests active. `N` must be positive and defaults to `1`.
+Every successful JSON-object response is immediately appended and flushed in
+completion order as:
 
 ```json
 {"id": "case-1", "response": {"choices": []}}
@@ -70,17 +75,37 @@ Network failures, HTTP 408, HTTP 429, and HTTP 5xx are retried up to four total
 attempts, with waits of one, two, and four seconds. The Python runner also retries
 malformed HTTP-2xx JSON. Other HTTP 4xx responses are not retried. A failed ID
 stays absent, later IDs continue, and the command exits nonzero if any ID fails.
+On Ctrl-C, the runner stops launching requests, finishes and persists active
+requests, and exits interrupted.
 
 ## Execution boundary
 
 The runner does not know benchmark semantics and does not transform requests. It
 does not select or load a model, accept GGUF arguments, manage the inference
 server, probe health, add authentication, impose a request timeout, grade results,
-or run requests in parallel. Dataset preparation, request profiles, inference
-server operation, and grading remain separate responsibilities.
+or choose a concurrency limit automatically. Dataset preparation, request
+profiles, inference server operation, and grading remain separate responsibilities.
 
 ## Benchmarks
 
 - [MMLU-Redux 2.0](benchmarks/mmlu_redux/README.md): prepare the official
   provider dataset, run it through this shared runner, and grade overall and
   per-subject accuracy.
+- [IFEval](benchmarks/ifeval/README.md): prepare the official instruction-following
+  dataset and grade it with the provider evaluator.
+- [LongBench v2](benchmarks/longbench_v2/README.md): prepare the official
+  zero-shot direct profile with provider-style middle truncation and grading.
+
+## Prepare all datasets
+
+After installing each benchmark's workstation dependencies, prepare every dataset
+up front with the effective context size of the target server:
+
+```sh
+python3 prepare.py --longbench-context-size 262144
+```
+
+Each preparer validates its existing published output and skips dataset loading
+when all aligned files are already complete. Pass `--force` to this command or an
+individual preparer to regenerate its output. In particular, use `--force` after
+changing the LongBench context size.

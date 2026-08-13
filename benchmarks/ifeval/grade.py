@@ -29,7 +29,9 @@ def reject_json_constant(value):
 
 
 def read_jsonl(path):
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
     if any(not line.strip() for line in lines):
         raise ValueError(f"{path.name} contains a blank record")
     records = []

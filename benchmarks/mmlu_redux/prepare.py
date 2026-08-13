@@ -18,6 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Prepare MMLU-Redux 2.0")
     parser.add_argument("--cache-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
@@ -65,7 +66,9 @@ def write_jsonl(path, records):
 
 
 def load_jsonl(path, record_name):
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
+    if lines[-1:] == [""]:
+        lines.pop()
     if any(not line.strip() for line in lines):
         raise ValueError(f"{record_name} contains a blank record")
     records = []
@@ -96,24 +99,56 @@ def validate_prepared(directory):
         raise ValueError("requests, IDs, and cases are not aligned")
 
 
-def publish(version, output):
-    previous_version = None
-    if output.exists() or output.is_symlink():
-        if not output.is_symlink():
-            raise ValueError("existing prepared output was not created by this command")
-        previous_target = Path(os.readlink(output))
-        if not previous_target.is_absolute():
-            previous_target = output.parent / previous_target
-        previous_version = previous_target.resolve()
+def already_prepared(output):
+    if not output.is_symlink():
+        return False
+    try:
+        validate_prepared(output)
+    except (OSError, ValueError):
+        return False
+    return True
 
-    pending_link = output.with_name(f".{output.name}.link-{uuid.uuid4().hex}")
-    relative_target = os.path.relpath(version, output.parent)
-    os.symlink(relative_target, pending_link, target_is_directory=True)
+
+def replace_symlink(target, output, purpose):
+    pending_link = output.with_name(f".{output.name}.{purpose}-{uuid.uuid4().hex}")
+    os.symlink(target, pending_link, target_is_directory=True)
     try:
         os.replace(pending_link, output)
     finally:
         if pending_link.is_symlink():
             pending_link.unlink()
+
+
+def output_points_to(output, version):
+    return output.is_symlink() and output.resolve() == version.resolve()
+
+
+def publish(version, output):
+    previous_version = None
+    previous_link_target = None
+    if output.exists() or output.is_symlink():
+        if not output.is_symlink():
+            raise ValueError("existing prepared output was not created by this command")
+        previous_link_target = os.readlink(output)
+        previous_target = Path(previous_link_target)
+        if not previous_target.is_absolute():
+            previous_target = output.parent / previous_target
+        previous_version = previous_target.resolve()
+
+    relative_target = os.path.relpath(version, output.parent)
+    try:
+        replace_symlink(relative_target, output, "link")
+    except BaseException:
+        if output_points_to(output, version):
+            if previous_link_target is None:
+                output.unlink()
+            else:
+                replace_symlink(
+                    previous_link_target,
+                    output,
+                    "rollback",
+                )
+        raise
 
     versions = version.parent.resolve()
     if (
@@ -163,7 +198,6 @@ def prepare(cache_dir, output):
     versions = output.parent / f".{output.name}.versions"
     versions.mkdir(exist_ok=True)
     version = Path(tempfile.mkdtemp(prefix="version-", dir=versions))
-    published = False
     try:
         write_jsonl(version / "requests.jsonl", requests)
         (version / "ids.txt").write_text(
@@ -172,15 +206,17 @@ def prepare(cache_dir, output):
         write_jsonl(version / "cases.jsonl", cases)
         validate_prepared(version)
         publish(version, output)
-        published = True
     finally:
-        if not published and version.exists():
+        if version.exists() and not output_points_to(output, version):
             shutil.rmtree(version)
 
 
 def main():
     args = parse_args()
     try:
+        if not args.force and already_prepared(args.output):
+            print(f"prepared output already exists in {args.output}; skipping")
+            return 0
         prepare(args.cache_dir, args.output)
     except (ImportError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

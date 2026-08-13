@@ -8,11 +8,7 @@ import re
 import shutil
 import sys
 import tempfile
-
-from datasets import load_dataset
-from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
-
+import uuid
 
 DATASET_ID = "zai-org/LongBench-v2"
 TOKENIZER_ID = "Qwen/Qwen3.6-35B-A3B"
@@ -28,7 +24,7 @@ TOKENIZER_FILES = [
 BENCHMARK_DIRECTORY = Path(__file__).resolve().parent
 PROMPT_TEMPLATE = (BENCHMARK_DIRECTORY / "upstream" / "0shot.txt").read_text(
     encoding="utf-8"
-).rstrip("\n")
+)
 
 
 def parse_args():
@@ -53,6 +49,7 @@ def parse_args():
         default=Path("prepared/longbench-v2"),
         help="Prepared benchmark directory.",
     )
+    parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
@@ -127,6 +124,7 @@ def prepare_records(dataset, tokenizer, context_size):
         raise ValueError("context size cannot fit the empty chat template")
 
     ids = []
+    seen_ids = set()
     requests = []
     cases = []
     for row in dataset:
@@ -135,7 +133,7 @@ def prepare_records(dataset, tokenizer, context_size):
         prepared_id = require_string(row, "_id")
         if not SAFE_ID.fullmatch(prepared_id):
             raise ValueError(f"unsafe LongBench ID: {prepared_id}")
-        if prepared_id in ids:
+        if prepared_id in seen_ids:
             raise ValueError(f"duplicate LongBench ID: {prepared_id}")
         for field in (
             "context",
@@ -161,6 +159,7 @@ def prepare_records(dataset, tokenizer, context_size):
             tokenizer, render_prompt(row), input_budget
         )
         ids.append(prepared_id)
+        seen_ids.add(prepared_id)
         requests.append(
             {
                 "messages": [{"role": "user", "content": prompt}],
@@ -189,12 +188,30 @@ def write_jsonl(path, records):
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def validate_staged(directory):
+def replace_symlink(target, output, purpose):
+    pending_link = output.with_name(f".{output.name}.{purpose}-{uuid.uuid4().hex}")
+    os.symlink(target, pending_link, target_is_directory=True)
+    try:
+        os.replace(pending_link, output)
+    finally:
+        if pending_link.is_symlink():
+            pending_link.unlink()
+
+
+def output_points_to(output, version):
+    return output.is_symlink() and output.resolve() == version.resolve()
+
+
+def validate_prepared(directory):
     request_lines = (directory / "requests.jsonl").read_text(
         encoding="utf-8"
-    ).splitlines()
+    ).split("\n")
     ids = (directory / "ids.txt").read_text(encoding="utf-8").splitlines()
-    case_lines = (directory / "cases.jsonl").read_text(encoding="utf-8").splitlines()
+    case_lines = (directory / "cases.jsonl").read_text(encoding="utf-8").split("\n")
+    if request_lines[-1:] == [""]:
+        request_lines.pop()
+    if case_lines[-1:] == [""]:
+        case_lines.pop()
     if (
         not request_lines
         or len(request_lines) != len(ids)
@@ -214,6 +231,16 @@ def validate_staged(directory):
         raise ValueError("prepared case IDs do not align")
 
 
+def already_prepared(output):
+    if not output.is_symlink():
+        return False
+    try:
+        validate_prepared(output)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def publish(output_directory, requests, ids, cases):
     output_directory.parent.mkdir(parents=True, exist_ok=True)
     staged = Path(
@@ -221,40 +248,58 @@ def publish(output_directory, requests, ids, cases):
             prefix=f".{output_directory.name}-version-", dir=output_directory.parent
         )
     )
-    temporary_link = None
+    previous_link_target = None
+    previous_generation = None
     try:
         write_jsonl(staged / "requests.jsonl", requests)
         (staged / "ids.txt").write_text(
             "".join(f"{item}\n" for item in ids), encoding="utf-8"
         )
         write_jsonl(staged / "cases.jsonl", cases)
-        validate_staged(staged)
+        validate_prepared(staged)
 
         if os.path.lexists(output_directory) and not output_directory.is_symlink():
             raise ValueError(
                 "prepared output path must be absent or a prior version symlink"
             )
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{output_directory.name}-link-", dir=output_directory.parent
-        )
-        os.close(descriptor)
-        temporary_link = Path(temporary_name)
-        temporary_link.unlink()
-        os.symlink(staged.name, temporary_link, target_is_directory=True)
-        os.replace(temporary_link, output_directory)
-        temporary_link = None
-        staged = None
+        if output_directory.is_symlink():
+            previous_link_target = os.readlink(output_directory)
+            previous_generation = Path(previous_link_target)
+            if not previous_generation.is_absolute():
+                previous_generation = output_directory.parent / previous_generation
+            previous_generation = previous_generation.resolve()
+        try:
+            replace_symlink(staged.name, output_directory, "link")
+        except BaseException:
+            if output_points_to(output_directory, staged):
+                if previous_link_target is None:
+                    output_directory.unlink()
+                else:
+                    replace_symlink(
+                        previous_link_target, output_directory, "rollback"
+                    )
+            raise
+        if (
+            previous_generation is not None
+            and previous_generation.parent == output_directory.parent.resolve()
+            and previous_generation.name.startswith(
+                f".{output_directory.name}-version-"
+            )
+        ):
+            shutil.rmtree(previous_generation, ignore_errors=True)
     finally:
-        if temporary_link is not None:
-            temporary_link.unlink(missing_ok=True)
-        if staged is not None:
+        if not output_points_to(output_directory, staged):
             shutil.rmtree(staged)
 
 
-def run(args):
+def prepare(cache, output, context_size):
+    from datasets import load_dataset
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+
     tokenizer_directory = snapshot_download(
         TOKENIZER_ID,
-        local_dir=str(args.cache / "tokenizer"),
+        local_dir=str(cache / "tokenizer"),
         allow_patterns=TOKENIZER_FILES,
     )
     tokenizer = AutoTokenizer.from_pretrained(
@@ -264,22 +309,25 @@ def run(args):
     dataset = load_dataset(
         DATASET_ID,
         split="train",
-        cache_dir=str(args.cache / "dataset"),
+        cache_dir=str(cache / "dataset"),
         download_mode="reuse_dataset_if_exists",
     )
-    requests, ids, cases = prepare_records(dataset, tokenizer, args.context_size)
-    publish(args.output, requests, ids, cases)
-    print(f"prepared {len(ids)} LongBench v2 requests in {args.output}")
-    return 0
+    requests, ids, cases = prepare_records(dataset, tokenizer, context_size)
+    publish(output, requests, ids, cases)
+    print(f"prepared {len(ids)} LongBench v2 requests in {output}")
 
 
 def main():
     args = parse_args()
     try:
-        return run(args)
+        if not args.force and already_prepared(args.output):
+            print(f"prepared output already exists in {args.output}; skipping")
+            return 0
+        prepare(args.cache, args.output, args.context_size)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == "__main__":
