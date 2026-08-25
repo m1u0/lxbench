@@ -1,5 +1,7 @@
 # LXBench
 
+English | [中文](README.zh.md)
+
 LXBench is a minimal, modular harness for running deterministic, code-graded LLM
 benchmarks against an already-running inference endpoint. Each benchmark owns its
 preparation and grading, while a small benchmark-agnostic execution layer runs
@@ -149,3 +151,7 @@ LXBench evaluates an already-running endpoint. It does not download or load
 models, manage the inference server, add authentication, compare endpoints,
 aggregate benchmark scores, judge regressions, or provide dedicated latency
 measurement.
+
+## Keeping the READMEs in sync
+
+Whenever either README changes, update its counterpart in the same change.
